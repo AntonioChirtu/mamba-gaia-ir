@@ -1,0 +1,26 @@
+_target_: src.models.mamba2_module.Mamba2LitModule
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.001
+  weight_decay: 0.0
+
+# TODO: replace with Cosine Decay with Warmup
+scheduler:
+  _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+  _partial_: true
+  mode: min
+  factor: 0.1
+  patience: 10
+
+net:
+  _target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
+  d_model: 16 # !!! Change also in mamba2_module
+  d_state: 16
+  d_conv: 4
+  expand: 2
+  headdim: 8
+
+# compile model for faster training with pytorch 2.0
+compile: false

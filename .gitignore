@@ -1,0 +1,19 @@
+# Data and Large Files
+GAIA/
+data/
+logs/
+checkpoints/
+*.zip
+*.tar.gz
+
+# Python Environment
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Build files
+dist/
+build/
+*.egg-info/
