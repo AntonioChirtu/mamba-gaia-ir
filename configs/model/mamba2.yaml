@@ -16,8 +16,8 @@ scheduler:
 
 net:
   _target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
-  d_model: 16 # !!! Change also in mamba2_module
-  d_state: 16
+  d_model: 128 # !!! Change also in mamba2_module
+  d_state: 32
   d_conv: 4
   expand: 2
   headdim: 8
