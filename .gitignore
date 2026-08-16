@@ -1,6 +1,8 @@
 # Data and Large Files
 GAIA/
-data/
+data/GAIA*/
+data/HF_cache/
+data/RSI*/
 logs/
 checkpoints/
 *.zip
@@ -17,3 +19,8 @@ venv/
 dist/
 build/
 *.egg-info/
+
+*sweep*
+.idea/
+.python-version
+

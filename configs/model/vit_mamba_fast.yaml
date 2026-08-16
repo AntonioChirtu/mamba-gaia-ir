@@ -1,0 +1,41 @@
+_target_: src.models.mamba2_module.Mamba2LitModule
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.0001  # Higher learning rate for faster convergence
+  weight_decay: 0.1  # Add weight decay for regularization 0.01 before
+
+# Use cosine decay with warmup for faster convergence
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  _partial_: true
+  T_max: 50
+  eta_min: 1e-6
+
+# ViT for images (no Mamba) - optimized for fast convergence
+image_net:
+  _target_: src.models.components.vit_optimized.ViTOnlySimpleOptimized
+  backbone: vit_b16
+  pretrained: true
+  d_model: 256
+  freeze_backbone: false  # Fine-tune for faster adaptation
+  use_layer_norm: true
+  dropout: 0.1
+
+# Common parameters
+d_model: 128  # Text model d_model
+image_d_model: 256  # Image model d_model
+
+# Mamba for text only
+text_net:
+  _target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
+  d_model: 128
+  d_state: 32
+  d_conv: 4
+  expand: 2
+  headdim: 8
+
+
+# compile model for faster training with pytorch 2.0
+compile: false

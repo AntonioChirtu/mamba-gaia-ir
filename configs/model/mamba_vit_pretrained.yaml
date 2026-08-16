@@ -1,0 +1,50 @@
+_target_: src.models.mamba2_module.Mamba2LitModule
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.0001  # Lower learning rate for pretrained model
+  weight_decay: 0.01
+
+# Use cosine decay with warmup for better convergence
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+  _partial_: true
+  T_0: 10  # First restart after 10 epochs
+  T_mult: 2  # Double period after each restart
+  eta_min: 1e-6
+
+# Mamba + ViT pretrained backbone for images
+image_net:
+  _target_: src.models.components.pretrained_vision.Mamba2WithPretrainedVision
+  vision_encoder:
+    _target_: src.models.components.pretrained_vision.PretrainedVisionEncoder
+    backbone: vit_b16  # Options: resnet50, resnet101, vit_b16
+    pretrained: true
+    feature_dim: 768
+    d_model: 128  # Reduce complexity
+    freeze_backbone: true  # Freeze initially for stability
+  mamba2_model:
+    _target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
+    d_model: 128  # Match image encoder
+    d_state: 16  # Reduce complexity
+    d_conv: 4
+    expand: 2
+    headdim: 8
+  d_model: 128
+
+# Common parameters
+d_model: 128  # Text model d_model
+image_d_model: 128  # Image model d_model (after ViT+Mamba)
+
+# Mamba for text only
+text_net:
+  _target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
+  d_model: 128
+  d_state: 16  # Reduce complexity to match image model
+  d_conv: 4
+  expand: 2
+  headdim: 8
+
+# compile model for faster training with pytorch 2.0
+compile: false

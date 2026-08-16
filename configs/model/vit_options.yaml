@@ -1,0 +1,111 @@
+# ViT Model Options for Image Processing
+# Choose from the options below and update your vit_mamba_simple.yaml
+
+# TORCHVISION MODELS (Built-in PyTorch)
+# =====================================
+
+# ViT-Base (Current)
+vit_b16:
+  backbone: vit_b16
+  feature_dim: 768
+  params: 86M
+  description: "ViT-Base with 16x16 patches"
+
+vit_b32:
+  backbone: vit_b32
+  feature_dim: 768
+  params: 86M
+  description: "ViT-Base with 32x32 patches"
+
+# ViT-Large (More Powerful)
+vit_l16:
+  backbone: vit_l16
+  feature_dim: 1024
+  params: 307M
+  description: "ViT-Large with 16x16 patches - RECOMMENDED"
+
+vit_l32:
+  backbone: vit_l32
+  feature_dim: 1024
+  params: 307M
+  description: "ViT-Large with 32x32 patches"
+
+# ViT-Huge (Most Powerful)
+vit_h14:
+  backbone: vit_h14
+  feature_dim: 1280
+  params: 632M
+  description: "ViT-Huge with 14x14 patches - MOST POWERFUL"
+
+# TIMM MODELS (Install with: pip install timm)
+# ===========================================
+
+# DeiT (Data-efficient Image Transformers)
+deit_base_distilled_patch16_224:
+  backbone: deit_base_distilled_patch16_224
+  feature_dim: 768
+  params: 86M
+  description: "DeiT-Base with distillation"
+
+deit_large_distilled_patch16_224:
+  backbone: deit_large_distilled_patch16_224
+  feature_dim: 1024
+  params: 307M
+  description: "DeiT-Large with distillation"
+
+# Swin Transformers (Hierarchical Vision Transformers)
+swin_base_patch4_window7_224:
+  backbone: swin_base_patch4_window7_224
+  feature_dim: 1024
+  params: 88M
+  description: "Swin-Base - Very efficient"
+
+swin_large_patch4_window7_224:
+  backbone: swin_large_patch4_window7_224
+  feature_dim: 1536
+  params: 197M
+  description: "Swin-Large - Great performance"
+
+# EfficientFormer
+efficientformer_l1_300:
+  backbone: efficientformer_l1_300
+  feature_dim: 448
+  params: 12M
+  description: "EfficientFormer-L1 - Very fast"
+
+# ConvNeXt V2 (Convolutional meets Transformer)
+convnextv2_large:
+  backbone: convnextv2_large
+  feature_dim: 1536
+  params: 196M
+  description: "ConvNeXt-V2 Large - Hybrid approach"
+
+# BEiT (BERT pre-training of Image Transformers)
+beit_base_patch16_224:
+  backbone: beit_base_patch16_224
+  feature_dim: 768
+  params: 86M
+  description: "BEiT-Base - BERT-style pretraining"
+
+beit_large_patch16_224:
+  backbone: beit_large_patch16_224
+  feature_dim: 1024
+  params: 304M
+  description: "BEiT-Large - More powerful"
+
+# USAGE RECOMMENDATIONS
+# ====================
+
+# For most users:
+# 1. vit_l16 - Best balance of performance and efficiency
+# 2. swin_large_patch4_window7_224 - If you want state-of-the-art
+# 3. vit_h14 - If you have GPU memory and want maximum performance
+
+# For limited resources:
+# 1. vit_b16 - Current choice, good baseline
+# 2. deit_base_distilled_patch16_224 - Similar performance, faster training
+
+# For research/experimentation:
+# 1. Try swin transformers for hierarchical features
+# 2. Try beit for BERT-style pretraining benefits
+# 3. Try convnextv2 for convolutional-transformer hybrid

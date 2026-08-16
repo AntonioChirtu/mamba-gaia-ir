@@ -1,29 +1,54 @@
 import copy
+import gc
 from typing import Any, Dict, Tuple
 
 import torch
+import torch.nn.functional as F
 from lightning import LightningModule
+from lightning.pytorch.loggers import WandbLogger
 from torchmetrics import Metric, MeanMetric, MaxMetric
+from torchmetrics.retrieval import RetrievalRecall
+import wandb
+import random
 
 
-class RetrievalRecall(Metric):
+class RetrievalRecallWrapper:
+    """
+    Wrapper for official TorchMetrics RetrievalRecall that handles similarity matrices.
+    """
+    
     def __init__(self, k=1):
-        super().__init__()
         self.k = k
-        self.add_state("correct", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
-
+        self.mean_metric = MeanMetric()
+    
     def update(self, logits):
-        # logits shape: [batch, batch] TODO
+        """
+        Update metric with similarity matrix.
+        
+        Args:
+            logits: [batch_size, batch_size] similarity matrix
+        """
         batch_size = logits.shape[0]
+        target = torch.arange(batch_size, device=logits.device)
+
+        # Get indices of top k matches
         _, top_k_indices = logits.topk(self.k, dim=1)
-        labels = torch.arange(batch_size, device=logits.device).view(-1, 1)
 
-        self.correct += (top_k_indices == labels).sum()
-        self.total += batch_size
+        # Check if target is in top_k (matches along dim 1)
+        correct = (top_k_indices == target.view(-1, 1)).any(dim=1)
 
+        # Ensure mean_metric is on same device as input
+        if self.mean_metric.device != logits.device:
+            self.mean_metric = self.mean_metric.to(logits.device)
+            
+        # Update your internal MeanMetric
+        self.mean_metric.update(correct.float())
+    
     def compute(self):
-        return self.correct / self.total
+        return self.mean_metric.compute()
+    
+    def reset(self):
+        self.mean_metric.reset()
 
 
 class Mamba2LitModule(LightningModule):
@@ -61,41 +86,51 @@ class Mamba2LitModule(LightningModule):
 
     def __init__(
             self,
-            net: torch.nn.Module,
+            image_net: torch.nn.Module,
+            text_net: torch.nn.Module,
             optimizer: torch.optim.Optimizer,
             scheduler: torch.optim.lr_scheduler,
             compile: bool,
-            d_model: int = 64,
+            d_model: int = 128,
+            image_d_model: int = 128,
             patch_size: int = 16,
             vocab_size: int = 50257
     ) -> None:
         """Initialize a `Mamba2LitModule`.
 
-        :param net: The model to train.
+        :param image_net: The model to use for image processing.
+        :param text_net: The model to use for text processing.
         :param optimizer: The optimizer to use for training.
         :param scheduler: The learning rate scheduler to use for training.
         """
         super().__init__()
 
+        # Multiscale augmentation parameters
+        self.base_size = 224
+        self.scale_factors = [0.75, 0.85, 1.0]
+        self.current_size = self.base_size
+
         # this line allows to access init params with 'self.hparams' attribute
         # also ensures init params will be stored in ckpt
-        self.save_hyperparameters(logger=False)
+        self.save_hyperparameters(logger=False, ignore=["image_net", "text_net"])
 
-        self.model1 = copy.deepcopy(net)
-        self.model2 = copy.deepcopy(net)
+        self.image_model = image_net
+        self.text_model = text_net
 
         # 1. Vision "Patch" Embedding: Turns [B, 3, 224, 224] -> [B, 196, d_model]
         self.patch_embed = torch.nn.Conv2d(
-            3, d_model, kernel_size=patch_size, stride=patch_size
+            3, image_d_model, kernel_size=patch_size, stride=patch_size
         )
 
         # 2. Text Embedding: Turns [B, 77] -> [B, 77, d_model]
         self.text_embed = torch.nn.Embedding(vocab_size, d_model)
 
-        self.proj1 = torch.nn.Linear(d_model, 512)
+        self.proj1 = torch.nn.Linear(image_d_model, 512)
         self.proj2 = torch.nn.Linear(d_model, 512)
 
         self.logit_scale = torch.nn.Parameter(torch.ones([]) * torch.log(torch.tensor(1 / 0.07)))
+
+        self.val_outputs = {'img_embs': [], 'txt_embs': [], 'raw_texts': []}
 
         # TODO: Make more complicated contrastive loss?
         # loss function
@@ -103,9 +138,14 @@ class Mamba2LitModule(LightningModule):
 
         # TODO: Add test recall, but for global set!
         # metric objects for calculating and averaging accuracy across batches
-        self.train_recall = RetrievalRecall(k=1)
-        self.val_r1 = RetrievalRecall(k=1)
-        self.val_r5 = RetrievalRecall(k=5)
+        self.train_recall = RetrievalRecallWrapper(k=1)
+        # Separate metrics for I2T and T2I
+        self.train_i2t_r1 = RetrievalRecallWrapper(k=1)
+        self.train_t2i_r1 = RetrievalRecallWrapper(k=1)
+        self.val_i2t_r1 = RetrievalRecallWrapper(k=1)
+        self.val_t2i_r1 = RetrievalRecallWrapper(k=1)
+        self.val_i2t_r5 = RetrievalRecallWrapper(k=5)
+        self.val_t2i_r5 = RetrievalRecallWrapper(k=5)
 
         # for averaging loss across batches
         self.train_loss = MeanMetric()
@@ -113,7 +153,15 @@ class Mamba2LitModule(LightningModule):
         self.test_loss = MeanMetric()
 
         # for tracking best so far validation accuracy
-        self.val_r1_best = MaxMetric()
+        self.val_i2t_r1_best = MaxMetric()
+        self.val_t2i_r1_best = MaxMetric()
+
+        self.test_r1 = RetrievalRecallWrapper(k=1)
+        self.test_r5 = RetrievalRecallWrapper(k=5)
+        self.test_r10 = RetrievalRecallWrapper(k=10)
+        
+        # Initialize test outputs storage
+        self.test_outputs = {}
 
     def forward(self, x: torch.Tensor, modality="image") -> torch.Tensor:
         """Perform a forward pass through the model `self.net`.
@@ -122,27 +170,38 @@ class Mamba2LitModule(LightningModule):
         :return: A tensor of logits.
         """
         if modality == "image":
-            # x is [batch, num_patches, patch_dim]
-            # [B, 3, 224, 224] -> [B, d_model, 14, 14] -> [B, d_model, 196]
-            x = self.patch_embed(x).flatten(2)
-            # -> [B, 196, d_model] (The 3D shape Mamba-2 expects!)
-            x = x.transpose(1, 2)
-            out = self.model1(x)
+            # Check if image_model is pretrained vision wrapper
+            if hasattr(self.image_model, 'vision_encoder'):
+                # Pretrained vision model: expects [B, 3, 224, 224]
+                out = self.image_model(x)
+            elif hasattr(self.image_model, 'vit'):
+                # ViT-only model: expects [B, 3, 224, 224]
+                # Set gradient checkpointing for memory efficiency
+                # self.image_model.vit.set_grad_checkpointing(True)
+                out = self.image_model(x)
+            else:
+                # Original patch embedding approach
+                # x is [batch, num_patches, patch_dim]
+                # [B, 3, 224, 224] -> [B, d_model, 14, 14] -> [B, d_model, 196]
+                x = self.patch_embed(x).flatten(2)
+                # -> [B, 196, d_model] (The 3D shape Mamba-2 expects!)
+                x = x.transpose(1, 2)
+                out = self.image_model(x)
         else:
             # x is [batch, seq_len, word_dim]
             # [B, seq_len] -> [B, seq_len, d_model]
             x = self.text_embed(x)
-            out = self.model2(x)
+            out = self.text_model(x)
 
         # 2. Global Pooling: Turn sequence into a single vector
         # Mamba returns [batch, length, dim]. We average across length.
-        out = out.mean(dim=1)
+        # For ViT-only models that already output pooled features, skip pooling
+        if out.dim() == 3:  # [B, seq_len, dim] - need pooling
+            out = out[:, -1, :]
+        # If out.dim() == 2, it's already [B, dim] - no pooling needed
 
         # 3. Project to shared IR space
-        if modality == "image":
-            out = self.proj1(out)
-        else:
-            out = self.proj2(out)
+        out = self.proj1(out) if modality == "image" else self.proj2(out)
 
         return out
 
@@ -152,9 +211,12 @@ class Mamba2LitModule(LightningModule):
         # by default lightning executes validation step sanity checks before training starts,
         # so it's worth to make sure validation metrics don't store results from these checks
         self.val_loss.reset()
-        self.val_r1.reset()
-        self.val_r5.reset()
-        self.val_r1_best.reset()
+        self.val_i2t_r1.reset()
+        self.val_t2i_r1.reset()
+        self.val_i2t_r5.reset()
+        self.val_t2i_r5.reset()
+        self.val_i2t_r1_best.reset()
+        self.val_t2i_r1_best.reset()
 
     def model_step(
             self, batch: Tuple[torch.Tensor, torch.Tensor]
@@ -183,6 +245,8 @@ class Mamba2LitModule(LightningModule):
         logits_t2i = logits_i2t.t()
 
         y = torch.arange(logits_i2t.shape[0], device=logits_i2t.device)
+
+        # Standard InfoNCE / CLIP Loss
         loss = (self.criterion(logits_i2t, y) + self.criterion(logits_t2i, y)) / 2
 
         return loss, logits_i2t, logits_t2i, y
@@ -197,22 +261,70 @@ class Mamba2LitModule(LightningModule):
         :param batch_idx: The index of the current batch.
         :return: A tensor of losses between model predictions and targets.
         """
-        loss, l_i2t, l_t2i, y = self.model_step(batch)
+        images, texts, _ = batch
 
-        self.train_recall.update(l_i2t)
-        self.train_recall.update(l_t2i)
+        if batch_idx % 10 == 0:
+            print("Resizing images...")
+            scale = random.choice(self.scale_factors)
+            new_size = int(self.base_size * scale)
+            # Ensure it's a multiple of your max stride (e.g., 32)
+            self.current_size = (new_size // 16) * 16
+            self.image_model.vit.image_size = self.current_size
+
+        if images.shape[-1] != self.current_size:
+            images = torch.nn.functional.interpolate(images, size=(self.current_size, self.current_size), mode='bicubic', align_corners=False)
+
+        pos_embed = self.image_model.vit.encoder.pos_embedding
+        cls_token = pos_embed[:, :1, :]
+        grid_tokens = pos_embed[:, 1:, :]
+
+        old_grid_size = int(grid_tokens.shape[1] **0.5)
+        new_grid_size = self.current_size // 16
+
+        if old_grid_size != new_grid_size:
+            with torch.no_grad():
+                grid_tokens = grid_tokens.reshape(1, old_grid_size, old_grid_size, -1).permute(0, 3, 1, 2)
+
+                grid_tokens = torch.nn.functional.interpolate(grid_tokens, size=(new_grid_size, new_grid_size), mode='bicubic', align_corners=False)
+
+                grid_tokens = grid_tokens.permute(0, 2, 3, 1).reshape(1, -1, 768)
+                new_pos_embed = torch.cat((cls_token, grid_tokens), dim=1).detach()
+        else:
+            new_pos_embed = pos_embed
+
+        original_embed = self.image_model.vit.encoder.pos_embedding
+        self.image_model.vit.encoder.pos_embedding = torch.nn.Parameter(
+            new_pos_embed,
+            requires_grad=self.image_model.vit.encoder.pos_embedding.requires_grad
+        )
+
+        loss, l_i2t, l_t2i, y = self.model_step((images, texts))
+
+        self.image_model.vit.encoder.pos_embedding = torch.nn.Parameter(
+            original_embed,
+            requires_grad=self.image_model.vit.encoder.pos_embedding.requires_grad
+        )
+
+        # Update separate I2T and T2I metrics
+        self.train_i2t_r1.update(l_i2t)
+        self.train_t2i_r1.update(l_t2i)
 
         # update and log metrics
         self.train_loss(loss)
         self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/R1", self.train_recall, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/I2T_R1", self.train_i2t_r1.compute(), on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/T2I_R1", self.train_t2i_r1.compute(), on_step=False, on_epoch=True, prog_bar=True)
 
         # return loss or backpropagation will fail
         return loss
 
     def on_train_epoch_end(self) -> None:
         "Lightning hook that is called when a training epoch ends."
-        pass
+        self.train_i2t_r1.reset()
+        self.train_t2i_r1.reset()
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         """Perform a single validation step on a batch of data from the validation set.
@@ -221,57 +333,141 @@ class Mamba2LitModule(LightningModule):
             labels.
         :param batch_idx: The index of the current batch.
         """
-        loss, l_i2t, l_t2i, y = self.model_step(batch)
+        # 1. Use your model_step for the loss (keep it consistent!)
+        images, texts, text_strings = batch
+        current_batch_size = images.shape[0]
 
-        self.val_r1.update(l_i2t)
-        self.val_r1.update(l_t2i)
-        self.val_r5.update(l_i2t)
-        self.val_r5.update(l_t2i)
+        self.image_model.vit.image_size = self.base_size
 
-        # update and log metrics
+        loss, l_i2t, l_t2i, y = self.model_step((images, texts))
         self.val_loss(loss)
-        self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/R1", self.val_r1, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/R5", self.val_r5, on_step=False, on_epoch=True, prog_bar=True)
+
+        # 2. Extract and store embeddings for Global Eval
+        img_emb = self.forward(images, modality="image")
+        txt_emb = self.forward(texts, modality="text")
+
+
+        self.val_outputs['img_embs'].append(img_emb.cpu())
+        self.val_outputs['txt_embs'].append(txt_emb.cpu())
+        self.val_outputs['raw_texts'].extend(text_strings)
+
+        self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=current_batch_size)
 
     def on_validation_epoch_end(self) -> None:
         "Lightning hook that is called when a validation epoch ends."
 
-        r1 = self.val_r1.compute()  # get current val acc
-        self.val_r1_best(r1)  # update best so far val acc
-        # log `val_acc_best` as a value through `.compute()` method, instead of as a metric object
-        # otherwise metric would be reset by lightning after each epoch
-        self.log("val/R1_best", self.val_r1_best.compute(), sync_dist=True, prog_bar=True)
+        if not self.val_outputs['img_embs']:
+            return
 
-    def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+        # 1. Gather all validation data
+        all_img = torch.cat(self.val_outputs['img_embs'], dim=0).to(self.device)
+        all_txt = torch.cat(self.val_outputs['txt_embs'], dim=0).to(self.device)
+        all_strings = self.val_outputs['raw_texts']
+
+        # 2. Normalize and compute Global Similarity Matrix
+        all_img = torch.nn.functional.normalize(all_img, p=2, dim=-1)
+        all_txt = torch.nn.functional.normalize(all_txt, p=2, dim=-1)
+        sim_matrix = all_img @ all_txt.t()
+
+        num_samples = sim_matrix.shape[0]
+        targets = torch.arange(num_samples, device=self.device)
+
+        # 3. Calculate R@1, R@5, R@10 for both directions
+        val_results = {}
+        for k in [1, 5, 10]:
+            # --- Image to Text (Rows) ---
+            _, top_k_i2t = sim_matrix.topk(k, dim=1)
+            r_i2t = (top_k_i2t == targets.view(-1, 1)).any(dim=1).float().mean()
+            val_results[f"val/I2T_R{k}"] = r_i2t
+
+            # --- Text to Image (Columns) ---
+            _, top_k_t2i = sim_matrix.t().topk(k, dim=1)
+            r_t2i = (top_k_t2i == targets.view(-1, 1)).any(dim=1).float().mean()
+            val_results[f"val/T2I_R{k}"] = r_t2i
+
+        # 4. Log all metrics to WandB/Progress Bar
+        self.log_dict(val_results, prog_bar=True, sync_dist=True)
+
+        # 5. Update "Best" trackers (Usually tracked via R1)
+        self.val_i2t_r1_best(val_results["val/I2T_R1"])
+        self.val_t2i_r1_best(val_results["val/T2I_R1"])
+        self.log("val/I2T_R1_best", self.val_i2t_r1_best.compute(), sync_dist=True)
+        self.log("val/T2I_R1_best", self.val_t2i_r1_best.compute(), sync_dist=True)
+
+        # 6. Save visual results table
+        self._save_results(sim_matrix, all_strings, phase="val")
+
+        # 7. Reset storage for the next epoch
+        self.val_outputs = {'img_embs': [], 'txt_embs': [], 'raw_texts': []}
+
+    def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int, dataloader_idx: int = 0) -> None:
         """Perform a single test step on a batch of data from the test set.
 
         :param batch: A batch of data (a tuple) containing the input tensor of images and target
             labels.
         :param batch_idx: The index of the current batch.
         """
-        loss, l_i2t, l_t2i, y = self.model_step(batch)
-
-        # TODO: also initialize in init
-        # update and log metrics
-        # self.test_r1.update(l_i2t)
-        # self.test_r1.update(l_t2i)
+        # images, texts = batch
         #
-        # self.test_r5.update(l_i2t)
-        # self.test_r5.update(l_t2i)
+        # # 1. Get embeddings from your Mamba2 model
+        # img_emb = self.forward(images, modality="image")
+        # txt_emb = self.forward(texts, modality="text")
         #
-        # self.test_r10.update(l_i2t)
-        # self.test_r10.update(l_t2i)
-
-        self.test_loss(loss)
-        self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
-
-        # self.log("test/R1", self.test_r1, on_step=False, on_epoch=True, prog_bar=True)
-        # self.log("test/R5", self.test_r5, on_step=False, on_epoch=True, prog_bar=True)
-        # self.log("test/R10", self.test_r10, on_step=False, on_epoch=True, prog_bar=True)
+        # # 2. Normalize (Retrieval is almost always done on the unit hypersphere)
+        # img_emb = torch.nn.functional.normalize(img_emb, p=2, dim=-1)
+        # txt_emb = torch.nn.functional.normalize(txt_emb, p=2, dim=-1)
+        #
+        # # 3. Optional: Calculate a batch-level loss for logging
+        # logits_i2t = (img_emb @ txt_emb.t()) * self.logit_scale.exp()
+        # y = torch.arange(logits_i2t.shape[0], device=logits_i2t.device)
+        # loss = F.cross_entropy(logits_i2t, y)
+        #
+        # # 4. Store Embeddings (following your dictionary pattern)
+        # if dataloader_idx not in self.test_outputs:
+        #     self.test_outputs[dataloader_idx] = {'img_embs': [], 'txt_embs': []}
+        #
+        # # Move to CPU to prevent GPU memory from filling up over 1000 samples
+        # self.test_outputs[dataloader_idx]['img_embs'].append(img_emb.cpu())
+        # self.test_outputs[dataloader_idx]['txt_embs'].append(txt_emb.cpu())
+        #
+        # return loss
+        pass
 
     def on_test_epoch_end(self) -> None:
         """Lightning hook that is called when a test epoch ends."""
+        # for dataloader_idx, outputs in self.test_outputs.items():
+        #     # Concatenate all stored embeddings
+        #     all_img = torch.cat(outputs['img_embs'], dim=0)  # [N, 512]
+        #     all_txt = torch.cat(outputs['txt_embs'], dim=0)  # [N, 512]
+        #
+        #     # Compute the Global Similarity Matrix [N, N]
+        #     # With 1000 samples, we can safely do this on the GPU
+        #     all_img = all_img.to(self.device)
+        #     all_txt = all_txt.to(self.device)
+        #     sim_matrix = all_img @ all_txt.t()
+        #
+        #     # Calculate Recall@k
+        #     num_samples = sim_matrix.shape[0]
+        #     targets = torch.arange(num_samples, device=self.device)
+        #
+        #     test_results = {}
+        #     for k in [1, 5, 10]:
+        #         # Image to Text (Rows of the matrix)
+        #         _, top_k_i2t = sim_matrix.topk(k, dim=1)
+        #         r_i2t = (top_k_i2t == targets.view(-1, 1)).any(dim=1).float().mean()
+        #
+        #         # Text to Image (Columns of the matrix / Transpose)
+        #         _, top_k_t2i = sim_matrix.t().topk(k, dim=1)
+        #         r_t2i = (top_k_t2i == targets.view(-1, 1)).any(dim=1).float().mean()
+        #
+        #         test_results[f'test/I2T_R{k}_dl_{dataloader_idx}'] = r_i2t
+        #         test_results[f'test/T2I_R{k}_dl_{dataloader_idx}'] = r_t2i
+        #
+        #     # Log and use your save method
+        #     self.log_dict(test_results, prog_bar=True)
+        #     self._save_results(all_img, all_txt, dataloader_idx)
+        #
+        # self.test_outputs.clear()
         pass
 
     def setup(self, stage: str) -> None:
@@ -284,8 +480,8 @@ class Mamba2LitModule(LightningModule):
         :param stage: Either `"fit"`, `"validate"`, `"test"`, or `"predict"`.
         """
         if self.hparams.compile and stage == "fit":
-            self.model1 = torch.compile(self.model1)
-            self.model2 = torch.compile(self.model2)
+            self.image_model = torch.compile(self.image_model)
+            self.text_model = torch.compile(self.text_model)
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Choose what optimizers and learning-rate schedulers to use in your optimization.
@@ -303,12 +499,37 @@ class Mamba2LitModule(LightningModule):
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    "monitor": "val/R1",
+                    "monitor": "train/T2I_R1",  # Use training metric since validation runs every 10 epochs
                     "interval": "epoch",
                     "frequency": 1,
                 },
             }
         return {"optimizer": optimizer}
+
+    def _save_results(self, sim_matrix, all_texts, phase="val"):
+        """Logs a table to WandB showing what the model predicted."""
+        if isinstance(self.logger, WandbLogger):
+            columns = ["Image_Index", "True_Caption", "Model_Top_Pick", "Confidence", "Correct"]
+            table = wandb.Table(columns=columns)
+
+            # Look at the first 15 images to keep the WandB payload light
+            num_samples_to_log = min(15, sim_matrix.shape[0])
+
+            # Convert raw similarities to probabilities for readability
+            probs = torch.softmax(sim_matrix[:num_samples_to_log], dim=1)
+            confidences, indices = probs.topk(1, dim=1)
+
+            for i in range(num_samples_to_log):
+                true_caption = all_texts[i]
+                predicted_idx = indices[i].item()
+                predicted_caption = all_texts[predicted_idx]
+                conf = confidences[i].item()
+                is_correct = (predicted_idx == i)
+
+                table.add_data(i, true_caption, predicted_caption, conf, is_correct)
+
+            # This will show up in WandB under the "val/predictions_sample" tab
+            self.logger.experiment.log({f"{phase}/predictions_sample": table})
 
 
 if __name__ == "__main__":

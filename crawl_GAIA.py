@@ -12,7 +12,7 @@ from itertools import combinations
 from collections import Counter
 
 
-def download_dataset_by_spheres(df, spheres_dict, output_dir='GAIA/', limit_per_tag=100):
+def download_dataset_by_spheres(df, spheres_dict, output_dir='GAIA/'):
     """
     Downloads images organized by Earth Sphere and Tag.
     """
@@ -22,7 +22,7 @@ def download_dataset_by_spheres(df, spheres_dict, output_dir='GAIA/', limit_per_
         for tag in tags:
             # 1. Filter for the tag
             mask = df['tag'].apply(lambda x: tag in x if isinstance(x, list) else False)
-            filtered_df = df[mask].head(limit_per_tag).copy()
+            filtered_df = df[mask].copy()
 
             if filtered_df.empty:
                 continue
@@ -34,7 +34,7 @@ def download_dataset_by_spheres(df, spheres_dict, output_dir='GAIA/', limit_per_
             os.makedirs(image_dir, exist_ok=True)
 
             new_json_structure = []
-            print(f"Downloading up to {limit_per_tag} images for [{tag}]...")
+            print(f"Downloading images for [{tag}]...")
 
             # 3. Download Loop
             for _, row in tqdm(filtered_df.iterrows(), total=len(filtered_df), leave=False):
@@ -71,6 +71,150 @@ def download_dataset_by_spheres(df, spheres_dict, output_dir='GAIA/', limit_per_
 
     print("\n✅ Hierarchical download complete!")
 
+
+def download_dataset_by_spheres_v2(df, output_dir):
+    """
+    Downloads images organized by the newly classified Earth Sphere.
+    Structure: GAIA/[Sphere]/[Primary_Tag]/images/
+    """
+    # 1. Group by the new classification results
+    # Ensure you use the correct column name here (e.g., 'earth_sphere')
+    spheres = df['earth_sphere'].unique()
+
+    for sphere in spheres:
+        print(f"\n=== Processing Sphere: {sphere} ===")
+        sphere_df = df[df['earth_sphere'] == sphere]
+
+        # 2. Within each sphere, we organize by the image's first tag
+        # to maintain a granular folder structure
+        # (Using .apply to get the first tag as a string)
+        sphere_df = sphere_df.copy()
+        sphere_df['primary_tag'] = sphere_df['tag'].apply(
+            lambda x: x[0] if isinstance(x, list) and len(x) > 0 else 'misc')
+
+        unique_tags = sphere_df['primary_tag'].unique()
+
+        for tag in unique_tags:
+            tag_filtered_df = sphere_df[sphere_df['primary_tag'] == tag]
+
+            # 3. Setup Hierarchical Directories
+            tag_dir = os.path.join(output_dir, str(sphere), str(tag).replace(" ", "_"))
+            image_dir = os.path.join(tag_dir, 'images')
+            os.makedirs(image_dir, exist_ok=True)
+
+            new_json_structure = []
+            print(f"Downloading {len(tag_filtered_df)} images for [{tag}]...")
+
+            # 4. Download Loop
+            for _, row in tqdm(tag_filtered_df.iterrows(), total=len(tag_filtered_df), leave=False):
+                image_url = row['image_src']
+                image_filename = f"{row['id']}.jpg"
+                image_path_full = os.path.join(image_dir, image_filename)
+
+                # Path for metadata relative to the tag folder
+                json_rel_path = f"images/{image_filename}"
+
+                try:
+                    if not os.path.exists(image_path_full):
+                        response = requests.get(image_url, stream=True, timeout=10)
+                        response.raise_for_status()
+                        with open(image_path_full, 'wb') as f:
+                            for chunk in response.iter_content(1024):
+                                f.write(chunk)
+
+                    new_json_structure.append({
+                        "image_id": row['id'],
+                        "image_path": json_rel_path,
+                        "captions": row.get('captions', []),
+                        "all_tags": row['tag'],
+                        "classified_sphere": sphere
+                    })
+                except Exception:
+                    continue
+
+                    # 5. Save Metadata for this specific tag
+            if new_json_structure:
+                output_json_path = os.path.join(tag_dir, 'metadata.json')
+                with open(output_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(new_json_structure, f, indent=4)
+
+    print("\n✅ Hierarchical download complete!")
+
+
+def download_dataset_by_spheres_v3(df, output_dir, min_count=100):
+    """
+    Downloads images organized by the newly classified Earth Sphere,
+    filtering for tags that have more than 100 images.
+    """
+    # Define your areas of interest
+    priority_spheres = ['Biosphere', 'Hydrosphere', 'Atmosphere']
+
+    spheres = df['earth_sphere'].unique()
+
+    for sphere in spheres:
+        # --- THE EXCLUSION TWEAK ---
+        if sphere not in priority_spheres:
+            print(f"\n--- Skipping Sphere: {sphere} (Not a priority) ---")
+            continue
+
+        print(f"\n=== Processing Priority Sphere: {sphere} ===")
+        sphere_df = df[df['earth_sphere'] == sphere].copy()
+
+        # Grouping by the first tag in the list
+        sphere_df['primary_tag'] = sphere_df['tag'].apply(
+            lambda x: x[0] if isinstance(x, list) and len(x) > 0 else 'misc')
+
+        unique_tags = sphere_df['primary_tag'].unique()
+
+        for tag in unique_tags:
+            tag_filtered_df = sphere_df[sphere_df['primary_tag'] == tag]
+
+            # --- THE ADDITION: Threshold Check ---
+            tag_count = len(tag_filtered_df)
+            if tag_count <= min_count:
+                # Optional: print(f"Skipping [{tag}]: Only {tag_count} images.")
+                continue
+
+            # 3. Setup Hierarchical Directories
+            tag_dir = os.path.join(output_dir, str(sphere), str(tag).replace(" ", "_"))
+            image_dir = os.path.join(tag_dir, 'images')
+            os.makedirs(image_dir, exist_ok=True)
+
+            new_json_structure = []
+            print(f"Downloading {tag_count} images for [{tag}]...")
+
+            # 4. Download Loop
+            for _, row in tqdm(tag_filtered_df.iterrows(), total=tag_count, leave=False):
+                image_url = row['image_src']
+                image_filename = f"{row['id']}.jpg"
+                image_path_full = os.path.join(image_dir, image_filename)
+                json_rel_path = f"images/{image_filename}"
+
+                try:
+                    if not os.path.exists(image_path_full):
+                        response = requests.get(image_url, stream=True, timeout=10)
+                        response.raise_for_status()
+                        with open(image_path_full, 'wb') as f:
+                            for chunk in response.iter_content(1024):
+                                f.write(chunk)
+
+                    new_json_structure.append({
+                        "image_id": row['id'],
+                        "image_path": json_rel_path,
+                        "captions": row.get('captions', []),
+                        "all_tags": row['tag'],
+                        "classified_sphere": sphere
+                    })
+                except Exception:
+                    continue
+
+            # 5. Save Metadata (Inside tag loop)
+            if new_json_structure:
+                output_json_path = os.path.join(tag_dir, 'metadata.json')
+                with open(output_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(new_json_structure, f, indent=4)
+
+    print("\n✅ Hierarchical download complete (Filtered for >100 images)!")
 
 def download_by_tag(df, target_tag='wildfire', output_dir='GAIA/val',
                     image_folder='single_tag_check_images', output_json_name='output.json'):
@@ -239,6 +383,123 @@ def download_images_and_create_json(input_file_path='input.json', output_dir='GA
         print(f"Error saving the new JSON file: {e}")
 
 
+def download_agri_dataset_by_tag(df, output_dir):
+    """
+    Creates a folder for each agriculture-related tag and downloads relevant images.
+    """
+    # These are the folder names that will appear inside GAIA_Agri
+    target_agri_tags = [
+        'agriculture',
+        'irrigation_systems',
+        'paddy_fields',
+        'vineyards_and_orchards',
+        'plantations',
+        'greenhouses',
+        'agricultural_cycle',
+        'pasture_and_rangeland',
+        'agricultural_expansion',
+        'agricultural_burning'
+    ]
+
+    # Keywords to ensure we don't miss images with agri-content in captions
+    agri_keywords = ['farm', 'crop', 'harvest', 'plow', 'orchard', 'vineyard']
+
+    print(f"Building Agricultural Dataset in: {output_dir}")
+
+    for folder_name in target_agri_tags:
+        # 1. Filter the cleaned 'tag' column for this specific folder_name
+        mask_tags = df['tag'].apply(lambda x: folder_name in x if isinstance(x, list) else False)
+
+        filtered_df = df[mask_tags].copy()
+
+        if filtered_df.empty:
+            print(f"Skipping {folder_name}: No images found.")
+            continue
+
+        # 2. Create the specific subfolder: D:/<output_dir>/<folder_name>/images/
+        tag_dir = os.path.join(output_dir, folder_name)
+        image_dir = os.path.join(tag_dir, 'images')
+        os.makedirs(image_dir, exist_ok=True)
+
+        new_json_structure = []
+        print(f"Processing folder [{folder_name}] - {len(filtered_df)} images found.")
+
+        # 3. Download Loop
+        for _, row in tqdm(filtered_df.iterrows(), total=len(filtered_df), leave=False):
+            image_filename = f"{row['id']}.jpg"
+            image_path_full = os.path.join(image_dir, image_filename)
+
+            try:
+                if not os.path.exists(image_path_full):
+                    response = requests.get(row['image_src'], stream=True, timeout=15)
+                    response.raise_for_status()
+                    with open(image_path_full, 'wb') as f:
+                        for chunk in response.iter_content(8192):
+                            f.write(chunk)
+
+                new_json_structure.append({
+                    "image_id": row['id'],
+                    "image_path": f"images/{image_filename}",
+                    "captions": row['captions'],
+                    "tags": row['tag']  # Includes all cleaned tags for the model to see
+                })
+            except Exception:
+                continue
+
+                # 5. Save metadata.json inside D:/GAIA_Agri/<folder_name>/
+        if new_json_structure:
+            meta_path = os.path.join(tag_dir, 'metadata.json')
+            with open(meta_path, 'w', encoding='utf-8') as f:
+                json.dump(new_json_structure, f, indent=4)
+
+    print(f"\n✅ All agricultural folders created at {output_dir}")
+
+
+def download_agri_master_dataset(df_universe, output_dir=r'D:/GAIA_Agri_Final'):
+    """
+    Downloads unique images into a single folder and creates a master metadata.json.
+    """
+    image_dir = os.path.join(output_dir, 'images')
+    os.makedirs(image_dir, exist_ok=True)
+
+    master_metadata = []
+    metadata_path = os.path.join(output_dir, 'metadata.json')
+
+    print(f"🚀 Downloading {len(df_universe)} unique agricultural images...")
+
+    for _, row in tqdm(df_universe.iterrows(), total=len(df_universe)):
+        image_id = row['id']
+        image_filename = f"{image_id}.jpg"
+        save_path = os.path.join(image_dir, image_filename)
+
+        # 1. Download Logic (Unique files only)
+        if not os.path.exists(save_path):
+            try:
+                response = requests.get(row['image_src'], timeout=15)
+                response.raise_for_status()
+                with open(save_path, 'wb') as f:
+                    f.write(response.content)
+            except Exception as e:
+                print(f"Skipping {image_id} due to error: {e}")
+                continue
+
+        # 2. Metadata Logic (Flatten sets to lists for JSON compatibility)
+        master_metadata.append({
+            "image_id": image_id,
+            "file_path": f"images/{image_filename}",
+            "subspheres": list(row['found_subspheres']),
+            "original_tags": row['tag'],
+            "caption": row['captions']
+        })
+
+    # 3. Save Master JSON
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(master_metadata, f, indent=4)
+
+    print(f"✅ Success! Data saved to {output_dir}")
+    print(f"Total Images: {len(df_universe)}")
+    print(f"Master Metadata: {metadata_path}")
+
 # This was made up after EDA on the top 126 tags (the ones that have a frequency > 100)
 cleaning_map = {
     'wildfires': 'wildfire',
@@ -395,26 +656,136 @@ scientific_map = {
     'landscape': 'land'
 }
 
+# earth_spheres = {
+#     'Atmosphere': [
+#         'atmosphere', 'tropical_cyclone', 'dust_storm', 'air_pollution',
+#         'precipitation', 'smoke_plume', 'climate'
+#     ],
+#     'Hydrosphere': [
+#         'water', 'floods', 'hydrology', 'oceanography', 'phytoplankton',
+#         'coastal', 'sediment'
+#     ],
+#     'Biosphere': [
+#         'vegetation', 'deforestation', 'wildfire', 'agriculture',
+#         'land_use', 'drought'
+#     ],
+#     'Geosphere': [
+#         'geology', 'topography', 'desert', 'volcanic_activity',
+#         'land_management', 'urban', 'natural_disaster'
+#     ],
+#     'Cryosphere': [
+#         'cryosphere', 'polar_regions', 'glacier', 'iceberg',
+#         'snow', 'winter', 'alaska', 'siberia'
+#     ]
+# }
+
+
 earth_spheres = {
     'Atmosphere': [
-        'atmosphere', 'tropical_cyclone', 'dust_storm', 'air_pollution',
-        'precipitation', 'smoke_plume', 'climate'
-    ],
-    'Hydrosphere': [
-        'water', 'floods', 'hydrology', 'oceanography', 'phytoplankton',
-        'coastal', 'sediment'
+        '3D Cloud Localization', '3D Rainfall', 'Adiabatic cooling', 'Aerosol', 'Aerosol Cloud',
+        'Aerosol Dispersion', 'Aerosol Effects', 'Aerosol Emissions', 'Aerosol Haze', 'Aerosol Impact',
+        'Aerosol Index', 'Aerosol Monitoring', 'Aerosol Movement', 'Aerosol Particles', 'Aerosol Plume',
+        'Aerosol Plumes', 'Aerosol Pollution', 'Aerosol Science', 'Aerosol Transport', 'Aerosol clouds',
+        'Aerosol effects', 'Aerosol impact', 'Aerosol interactions', 'Aerosol particles', 'Aerosol transport',
+        'Aerosol-cloud interactions', 'Aerosols', 'African Dust', 'African Dust Storms', 'Air Pollution',
+        'Air Quality', 'Airborne Dust', 'Aircraft Dissipation Trails', 'Airglow', 'Albedo',
+        'Alberta Clipper', 'Ammonia', 'Anvil Cloud', 'Anvil Clouds', 'Arctic Air', 'Arctic Blast',
+        'Arctic Haze', 'Arctic Oscillation', 'Arctic air mass', 'Arctic chill', 'Arctic stratosphere',
+        'Ash Cloud', 'Ash Dispersal', 'Ash Dispersion', 'Ash Emission', 'Ash Emissions', 'Ash Fallout',
+        'Ash Plume', 'Ash Plumes', 'Ash Vortices', 'Asian Brown Cloud', 'Asian Dust', 'Atmosphere',
+        'Atmospheric', 'Atmospheric Aerosols', 'Atmospheric Analysis', 'Atmospheric Circulation',
+        'Atmospheric Composition', 'Atmospheric Conditions', 'Atmospheric Disturbance', 'Atmospheric Dust',
+        'Atmospheric Dynamics', 'Atmospheric Effects', 'Atmospheric Event', 'Atmospheric Events',
+        'Atmospheric Gravity Waves', 'Atmospheric Haze', 'Atmospheric Inversion', 'Atmospheric Monitoring',
+        'Atmospheric Motion', 'Atmospheric Observation', 'Atmospheric Particles', 'Atmospheric Particulate',
+        'Atmospheric Patterns', 'Atmospheric Phenomena', 'Atmospheric Phenomenon', 'Atmospheric Pollution',
+        'Atmospheric Pressure', 'Atmospheric Processes', 'Atmospheric Radiation', 'Atmospheric River',
+        'Atmospheric Rivers', 'Atmospheric Science', 'Atmospheric Smoke', 'Atmospheric Transport',
+        'Atmospheric Turbulence', 'Atmospheric Waves', 'Atmospheric chemistry', 'Atmospheric convection',
+        'Aurora', 'Aurora Australis', 'Aurora Borealis', 'Auroras', 'Blizzard', 'Bomb Cyclone',
+        'Carbon Dioxide', 'Carbon Monoxide', 'Cirrus Clouds', 'Climate', 'Cloud', 'Cloud Analysis',
+        'Cloud Cover', 'Cloud Dynamics', 'Cloud Formation', 'Cloud Patterns', 'Cloud Streets',
+        'Cloud Vortex', 'Cold Front', 'Cyclone', 'Dust Storm', 'Extreme Weather', 'Hurricane',
+        'Jet Stream', 'Lightning', 'Meteorology', 'Monsoon', 'Ozone', 'Precipitation', 'Smog',
+        'Storm', 'Temperature', 'Weather', 'Wind'
     ],
     'Biosphere': [
-        'vegetation', 'deforestation', 'wildfire', 'agriculture',
-        'land_use', 'drought'
-    ],
-    'Geosphere': [
-        'geology', 'topography', 'desert', 'volcanic_activity',
-        'land_management', 'urban', 'natural_disaster'
+        'Active Fire', 'Active Fires', 'Agricultural', 'Agricultural Areas', 'Agricultural Burning',
+        'Agricultural Damage', 'Agricultural Development', 'Agricultural Expansion', 'Agricultural Fires',
+        'Agricultural Impact', 'Agricultural Land', 'Agricultural Land Use', 'Agricultural Monitoring',
+        'Agricultural Plains', 'Agricultural Practices', 'Agricultural Region', 'Agricultural Run-off',
+        'Agricultural Runoff', 'Agricultural Zones', 'Agricultural burning', 'Agricultural fires',
+        'Agricultural monitoring', 'Agricultural patterns', 'Agricultural practices', 'Agriculture',
+        'Agriculture Impact', 'Agriculture fires', 'Algae', 'Algae Bloom', 'Algae Blooms', 'Algal Bloom',
+        'Algal Blooms', 'Amazon Rainforest', 'Anaerobic Bacteria', 'Animal Tracking', 'Antarctic Wildlife',
+        'Aquaculture', 'Aquatic Ecosystem', 'Aquatic Plants', 'Aquatic Vegetation', 'Arctic Ecosystem',
+        'Arctic Vegetation', 'Atlantic Forest', 'Atlantic Rainforest', 'Autumn Colors', 'Autumn Foliage',
+        'Avian Influenza', 'Banana Plantation', 'Bialowieza National Park', 'Biodiversity', 'Biological',
+        'Biomass', 'Biomass Burning', 'Biomes', 'Biosphere', 'Biosphere Reserve', 'Bird Habitat',
+        'Boreal Forest', 'Brown Bears', 'Cactus Conservation', 'Carbon Absorption', 'Carbon Biomass',
+        'Carbon Sequestration', 'Carbon Sink', 'Caribou', 'Cash Crops', 'Cattle Ranching', 'Cerrado',
+        'Chaparral', 'Chlorophyll', 'Chlorophyll Bloom', 'Chlorophyll Concentration', 'Cicada Emergence',
+        'Citrus Growing', 'Coconut Plantation', 'Coffee Plantation', 'Conifer Forests', 'Crop Analysis',
+        'Crop Burning', 'Crop Damage', 'Crop Fires', 'Crop Mapping', 'Croplands', 'Crops', 'Cyanobacteria',
+        'Deciduous Forests', 'Defoliation', 'Deforestation', 'Dengue fever', 'Diatoms', 'Dinoflagellates',
+        'Ecological Diversity', 'Ecology', 'Ecosystem', 'Elephants', 'Endemic Species', 'Everglades',
+        'Farming', 'Fish Farms', 'Fisheries', 'Flamingos', 'Flower Fields', 'Forest', 'Forest Fire',
+        'Forestry', 'Fynbos', 'Grassland', 'Mangroves', 'Plankton', 'Vegetation', 'Wildlife'
     ],
     'Cryosphere': [
-        'cryosphere', 'polar_regions', 'glacier', 'iceberg',
-        'snow', 'winter', 'alaska', 'siberia'
+        'Adelie Coast', 'Amery Ice Shelf', 'Amundsen Gulf', 'Amundsen Sea', 'Antarctic', 'Antarctic Ice',
+        'Antarctic Ice Flow', 'Antarctic Ice Shelf', 'Antarctic Sea Ice', 'Antarctic warming',
+        'Antarctica', 'Arctic', 'Arctic Change', 'Arctic Cold', 'Arctic Conditions', 'Arctic Expedition',
+        'Arctic Ocean', 'Arctic Region', 'Arctic Sea Ice', 'Arctic Thaw', 'Arctic Thawing', 'Arctic ice',
+        'Arctic sea ice', 'Autumn Ice', 'Autumn Snow', 'Baffin Bay', 'Barents Sea', 'Beaufort Sea',
+        'Bellingshausen Sea', 'Bering Sea', 'Bering Strait', 'Blowing Snow', 'Brunt Ice Shelf',
+        'Calving', 'Calving Event', 'Calving Front', 'Canadian Arctic', 'Coastal Ice', 'Columbia Glacier',
+        'CryoSat', 'Cryosphere', 'Debris-Covered Glaciers', 'Deglaciation', 'Early Snowfall',
+        'Early Winter', 'East Antarctica', 'Epishelf Lake', 'Fast Ice', 'Fedchenko', 'Frozen',
+        'Frozen Bay', 'Frozen Lake', 'Frozen Lakes', 'Frozen Rivers', 'Frozen Waters', 'Glacial',
+        'Glacial Dynamics', 'Glacial Erosion', 'Glacial Flood', 'Glacial Lake', 'Glacial Melt',
+        'Glacial Movement', 'Glacial Retreat', 'Glacial Runoff', 'Glaciation', 'Glacier',
+        'Glacier Bay', 'Glacier Calving', 'Glacier Collapse', 'Glacier Flow', 'Glacier Melt',
+        'Glacier National Park', 'Glaciers', 'Glaciology', 'Ice', 'Ice Shelf', 'Iceberg',
+        'Permafrost', 'Ross Ice Shelf', 'Sea Ice', 'Snow', 'Snow Cover', 'Tundra'
+    ],
+    'Geosphere': [
+        'Adrar Plateau', 'Aeolian Processes', 'Afar Depression', 'Ahaggar Mountains', 'Alaid Volcano',
+        'Al Hajar Mountains', 'Alaska Range', 'Alluvial Fans', 'Alps', 'Altai Mountains', 'Altiplano',
+        'Ambrym Volcano', 'Anak Krakatau', 'Anatahan Volcano', 'Andean Volcanic Belt', 'Andes Mountains',
+        'Apennine Range', 'Appalachian Mountains', 'Arid Land', 'Arid Terrain', 'Artisanal Mining',
+        'Aseismic Slip', 'Astrobleme', 'Atacama Desert', 'Atlas Mountains', 'Basalt Plateau',
+        'Basaltic Lava Flows', 'Basin', 'Barchan Dunes', 'Badlands', 'Bighorn Mountains', 'Black Rock Desert',
+        'Blue Ridge Mountains', 'Brooks Range', 'Burn Scar', 'Caldera', 'Canyon', 'Carpathian Mountains',
+        'Cascade Range', 'Caucasus Mountains', 'Cinder Cones', 'Cliffs', 'Coal Mining', 'Coastal Geomorphology',
+        'Colorado Plateau', 'Continental Divide', 'Copper Mining', 'Crater', 'Deccan Plateau',
+        'Dendritic Patterns', 'Desert', 'Diamond Mining', 'Digital Tectonic Activity Map',
+        'Dinosaur Fossils', 'Dune Field', 'Dunes', 'Earthquake', 'Earthquake Analysis',
+        'Earthquake faults', 'Earthquakes', 'Elevation', 'Emi Koussi', 'Erosion', 'Eruption',
+        'Fault Line', 'Fault Lines', 'Fossils', 'Fuego Volcano', 'Geohazard', 'Geologic Features',
+        'Geologic Mapping', 'Geological Activity', 'Geological Formation', 'Geology', 'Geomorphology',
+        'Geothermal', 'Geysers', 'Gobi Desert', 'Gold Mining', 'Grand Canyon', 'Mountains',
+        'Plateau', 'Rock', 'Sediment', 'Soil', 'Tectonic', 'Volcano'
+    ],
+    'Hydrosphere': [
+        'Acidic Lake', 'Adriatic Sea', 'Aegean Sea', 'Agulhas Current', 'Agusan River', 'Alboran Sea',
+        'Alkaline Lake', 'Alpine Lake', 'Amazon River', 'Amazon River Delta', 'Amu Darya River',
+        'Andaman Sea', 'Angara River', 'Antarctic Circumpolar Current', 'Aquamarine Waters',
+        'Aquifer', 'Aquifer Depletion', 'Aquifer System', 'Arabian Sea', 'Arafura Sea', 'Aral Sea',
+        'Arctic Waters', 'Argentine Sea', 'Arkansas River', 'Artificial Lake', 'Atlantic Ocean',
+        'Atoll', 'Ayeyarwady River', 'Bahama Banks', 'Baltic Sea', 'Banda Sea', 'Barrier Reef',
+        'Bathymetry', 'Bay', 'Bay of Bengal', 'Bay of Biscay', 'Beach', 'Benguela Current',
+        'Benguela Upwelling', 'Bering Sea', 'Betsiboka Estuary', 'Black Sea', 'Black Water',
+        'Bo Hai', 'Bosphorus Strait', 'Brackish Water', 'Brahmaputra River', 'Braided River',
+        'Bristol Bay', 'Buzzards Bay', 'Caribbean Sea', 'Caspian Sea', 'Celebes Sea', 'Celtic Sea',
+        'Chesapeake Bay', 'Choked Lagoon', 'Chukchi Sea', 'Closed-basin lake', 'Coastal Currents',
+        'Coastal Estuaries', 'Coastal Flooding', 'Coastal Lagoons', 'Coastal Oceanography',
+        'Coastal Waters', 'Colorado River', 'Congo River', 'Coral Reef', 'Coral Sea', 'Currents',
+        'Dam', 'Danube Delta', 'Danube River', 'Dead zone', 'Delta', 'Dnieper River', 'Drainage',
+        'Drake Passage', 'Drought', 'East Australian Current', 'East China Sea', 'Ebro Delta',
+        'Ebro River', 'Eddies', 'Elbe River', 'English Channel', 'Estuary', 'Euphrates River',
+        'Eutrophication', 'Evaporation', 'Flooding', 'Freshwater', 'Ganges River', 'Hydrology',
+        'Lake', 'Ocean', 'River', 'Water'
     ]
 }
 
@@ -499,6 +870,31 @@ modality_mapping = {
     "numerical model": "simulation/model"
 }
 
+# Use this mapping ALONE for your specialized GAIA_Agri project
+agri_specialized_map = {
+    # --- BROAD AGRICULTURE ---
+    'agriculture': 'agriculture',
+    'agricultural': 'agriculture',
+    'agricultural impact': 'agriculture',
+    'land use': 'agriculture',
+    'land cover': 'agriculture',
+    'cultivated_land': 'agriculture',
+    'croplands': 'agriculture',
+
+    # --- WETLANDS & PADDYS ---
+    'wetlands': 'wetlands_and_paddys',
+    'coastal wetlands': 'wetlands_and_paddys',
+    'paddy_fields': 'wetlands_and_paddys',
+
+    # --- AGRI-FIRE (Important for Remote Sensing) ---
+    'agricultural fires': 'agricultural_burning',
+    'burn scars': 'agricultural_burning',
+
+    # --- THE IMPACT ---
+    'agricultural expansion': 'agricultural_expansion',
+    'deforestation': 'agricultural_expansion'
+}
+
 
 def apply_mapping(tag_list, mapping):
     if not isinstance(tag_list, list): return []
@@ -527,16 +923,44 @@ def check_tag_context(df, target, n=15):
 
 
 def classify_to_sphere(image_tags):
-    # Calculate overlap for each Earth Sphere
-    scores = {sphere: len(set(image_tags) & set(sphere_tags))
-              for sphere, sphere_tags in earth_spheres.items()}
+    tag_blob = " ".join([str(t).lower() for t in image_tags])
 
-    # Pick the sphere with the most matching tags
+    anchors = {
+        'Atmosphere': ['dust_storm', 'cyclon', 'typhoon', 'hurricane', 'tornado', 'smoke_plume', 'aerosol', 'cloud',
+                       'ash', 'haze', 'meteorology', 'weather_pattern'],
+        'Hydrosphere': ['water', 'ocean', 'sea', 'river', 'lake', 'flood', 'delta', 'estuar', 'phytoplankton', 'algae',
+                        'marine', 'coast', 'reef', 'reservoir', 'currents', 'hydrology', 'tidal'],
+        'Biosphere': ['agri', 'farm', 'crop', 'forest', 'veget', 'plant', 'fire', 'burn', 'wildfire', 'ndvi', 'paddy',
+                      'tree', 'leaf', 'flora', 'harvest', 'deforest', 'ecology', 'habitat', 'irrigat', 'cultiv',
+                      'plantation', 'orchard'],
+        'Cryosphere': ['ice', 'snow', 'glacier', 'polar', 'arctic', 'freeze', 'frost', 'permafrost', 'antarct',
+                       'iceberg', 'shelf', 'meltwater'],
+        'Geosphere': ['geology', 'mining', 'volcan', 'earthq', 'soil', 'mountain', 'topography', 'urban', 'city',
+                      'plateau', 'desert', 'land_use', 'land_management', 'geography']
+    }
+
+    scores = {sphere: 0 for sphere in anchors}
+
+    for sphere, stems in anchors.items():
+        for stem in stems:
+            if stem in tag_blob:
+                scores[sphere] += 2
+
+                # --- STRATEGIC WEIGHTING ---
+    if scores['Biosphere'] > 0: scores['Biosphere'] += 5  # Maximum protection for your top interest
+    if scores['Hydrosphere'] > 0: scores['Hydrosphere'] += 2
+    if scores['Atmosphere'] > 0: scores['Atmosphere'] += 1
+
+    # Geosphere Tax: Only wins if it's the ONLY clear signal
+    if scores['Geosphere'] > 0: scores['Geosphere'] -= 2
+
     top_sphere = max(scores, key=scores.get)
 
-    # Label as 'General/Multi-Sphere' if no specific tags match or if there's a tie
-    if scores[top_sphere] == 0:
-        return 'General Earth'
+    if scores[top_sphere] <= 0:
+        if any(c in tag_blob for c in ['cold', 'winter', 'degree']):
+            return 'Cryosphere'
+        return 'Geosphere'
+
     return top_sphere
 
 
@@ -568,6 +992,20 @@ def apply_mapping_robust(tag_list, mapping):
     return sorted(list(cleaned))
 
 
+def apply_agri_mapping_strict(tag_list, mapping):
+    if not isinstance(tag_list, list):
+        return []
+
+    # ONLY keep the tag if it's a key in our agriculture map
+    # Then replace it with the clean value from the map
+    cleaned = {mapping[t.strip().lower()] for t in tag_list if t.strip().lower() in mapping}
+
+    return sorted(list(cleaned))
+
+
+
+
+
 if __name__ == '__main__':
     # Below is for downloading images
     # download_images_and_create_json(input_file_path='GAIA/val_data.json')
@@ -576,6 +1014,113 @@ if __name__ == '__main__':
     print("Loading dataset...")
     ds = load_dataset("azavras/GAIA", split="train")
     df = pd.DataFrame(ds)
+
+    # print(df['tag'].explode().unique())
+    # print(df[df['tag'][1].any() == "Agriculture"].count())
+
+    # subsphere_definitions = {
+    #     "Agriculture/Farming": ["agri", "farm", "crop", "paddy", "cultiv", "pasture", "vineyard", "orchard",
+    #                             "plantation", "irrigation"],
+    #     "Land Cover/Land Use": ["land use", "land cover", "land monitoring"], # Removed 'urban', 'built-up', 'landscape'
+    #     "Vegetation Dynamics": ["vegetation", "canopy", "greenness", "ndvi", "biomass", "leaf"], # Removed 'forest', 'chlorophyll' (aquatic focus)
+    #     "Climate Change/Impact": ["environmental impact"], # Removed 'climate', 'global warming', 'carbon', 'emissions' (too broad)
+    #     "Water Quality": ["pollution", "sediment"],  # Removed 'turbidity', 'chlorophyll-a', 'algal', 'phytoplankton'
+    #     "Drought/Arid Conditions": ["drought", "arid", "dry", "water scarcity", "evaporation"],  # Removed 'desert'
+    #     "Surface Hydrology": ["reservoir", "basin"], # Removed 'surface water', 'lake', 'pond' (usually natural/non-agri)
+    #     "Precipitation Patterns": ["precipitation", "rainfall", "monsoon"],  # Removed 'snow', 'storm', 'hail'
+    #     "Land Management": ["land management", "reclamation"], # Removed 'restoration', 'conservation', 'protected area'
+    #     "Land Surface Temperature": ["surface temperature", "lst", "thermal"],  # Removed 'heat', 'urban heat island'
+    #     "Seasonal Changes": ["season", "phenology", "harvest", "planting"] # Added 'harvest/planting', removed 'winter/summer/autumn/interannual'
+    # }
+
+    # subsphere_definitions = {
+    #     "Agriculture/Farming": ["agri", "farm", "crop", "paddy", "cultiv", "pasture", "vineyard", "orchard",
+    #                             "plantation", "irrigation", "agricultural", "agricultural burning",
+    #                             "agricultural expansion", "agricultural land", "agricultural monitoring",
+    #                             "agricultural practices", "agricultural runoff", "aquaculture", "cash crops",
+    #                             "cattle ranching", "center-pivot irrigation", "citrus growing", "coconut farming",
+    #                             "coffee plantation", "corn fields", "crop analysis", "crop damage", "crop monitoring",
+    #                             "crop yield", "croplands", "desert agriculture", "dryland agriculture", "farming",
+    #                             "farmland loss", "fish farms", "flooded rice fields", "flower fields", "livestock",
+    #                             "olive oil production", "palm oil", "pastoralism", "precision agriculture",
+    #                             "rice cultivation", "wheat production"],
+    #     "Land Cover/Land Use": ["land use", "land cover", "land monitoring", "agricultural land use",
+    #                             "land cover analysis", "land cover change", "land cover classification",
+    #                             "land cover mapping", "land use change", "land use and land cover", "landcover",
+    #                             "landcover change"],
+    #     "Vegetation Dynamics": ["vegetation", "canopy", "greenness", "ndvi", "biomass", "leaf", "ndvi anomaly",
+    #                             "vegetation change", "vegetation conditions", "vegetation cover", "vegetation health",
+    #                             "vegetation index", "vegetation phenology", "vegetation stress", "leaf area index",
+    #                             "plant indices", "photosynthesis"],
+    #     "Climate Change/Impact": ["environmental impact", "agricultural impact", "climate adaptation", "climate impact",
+    #                               "climate resilience", "climate vulnerability"],
+    #     "Water Quality": ["nutrient pollution", "sediment runoff", "agricultural runoff", "eutrophication", "nutrient runoff",
+    #                       "water quality", "water pollution"],
+    #     "Drought/Arid Conditions": ["drought", "arid", "dry", "water scarcity", "evaporation", "aridity",
+    #                                 "desertification", "drought impact", "drought monitoring", "flash drought",
+    #                                 "water shortage"],
+    #     "Surface Hydrology": ["reservoir", "basin", "water storage", "lakes and reservoirs", "ephemeral water body",
+    #                           "water bodies"],
+    #     "Precipitation Patterns": ["precipitation", "rainfall", "monsoon", "rainfall patterns", "monsoon rains",
+    #                                "wet season", "precipitation analysis"],
+    #     "Land Management": ["land management", "reclamation", "soil conservation", "landscape management",
+    #                         "conservation efforts", "land administration"],
+    #     "Land Surface Temperature": ["surface temperature", "lst", "thermal", "brightness temperature",
+    #                                  "thermal imagery", "thermal patterns", "land surface temperature"],
+    #     "Seasonal Changes": ["season", "phenology", "harvest", "planting", "growing season", "harvest season",
+    #                          "planting season", "vegetation phenology", "wet season", "dry season", "spring vegetation",
+    #                          "autumn vegetation"]
+    # }
+    #
+    # tag_to_subsphere = {}
+    # all_tags_in_ds = df['tag'].explode().dropna().unique()
+    #
+    # for tag in all_tags_in_ds:
+    #     tag_lower = str(tag).lower()
+    #     matched_categories = []
+    #     for category, keywords in subsphere_definitions.items():
+    #         if any(k in tag_lower for k in keywords):
+    #             matched_categories.append(category)
+    #     if matched_categories:
+    #         tag_to_subsphere[tag] = matched_categories
+    #
+    #
+    # # 3. Create a helper function to identify if a row belongs to our target universe
+    # def get_row_subspheres(tags):
+    #     if not isinstance(tags, list): return set()
+    #     categories = set()
+    #     for t in tags:
+    #         if t in tag_to_subsphere:
+    #             categories.update(tag_to_subsphere[t])
+    #     return categories
+    #
+    #
+    # # 4. Apply the mapping to the dataframe
+    # df['found_subspheres'] = df['tag'].apply(get_row_subspheres)
+    #
+    # # 5. Calculate Statistics
+    # total_images_in_universe = df[df['found_subspheres'].map(len) > 0]
+    #
+    # print(f"📊 --- DATASET SUBSPHERE CENSUS ---")
+    # print(f"Total Unique Images in these categories: {len(total_images_in_universe)}")
+    # print(f"Percentage of Total Dataset: {(len(total_images_in_universe) / len(df)) * 100:.2f}%\n")
+    #
+    # # 6. Break down by category
+    # category_counts = {}
+    # for category in subsphere_definitions.keys():
+    #     count = df['found_subspheres'].apply(lambda x: category in x).sum()
+    #     category_counts[category] = count
+    #
+    # # Sort and display
+    # sorted_counts = dict(sorted(category_counts.items(), key=lambda item: item[1], reverse=True))
+    # print(f"{'Subsphere Category':<30} | {'Image Count':<10}")
+    # print("-" * 45)
+    # for cat, count in sorted_counts.items():
+    #     print(f"{cat:<30} | {count:<10}")
+    #
+    # all_unique_tags = df['tag'].explode().unique()
+    # print(f"There are {len(all_unique_tags)} unique tags.")
+
 
     # ---------- Resolution, Modalities, Satellite
     cols_to_check = ['resolution', 'modalities', 'satellite']
@@ -593,6 +1138,8 @@ if __name__ == '__main__':
     # ---------- Clean set
     full_mapping = {**master_clean_map, **scientific_map}
     df['tag'] = df['tag'].apply(apply_mapping, mapping=full_mapping)
+
+    # df['tag'] = df['tag'].apply(apply_agri_mapping_strict, mapping=agri_specialized_map)
 
     df['satellite_clean'] = df['satellite'].apply(apply_mapping_robust, mapping=satellite_mapping)
 
@@ -744,4 +1291,24 @@ if __name__ == '__main__':
 
     # print(df)
     # download_by_tag(df, target_tag='wildfire')
-    download_dataset_by_spheres(df, earth_spheres)
+
+    data_dir = r'\\wsl.localhost\Ubuntu-22.04\home\antonio\projects\mamba-gaia-ir\data\GAIA'
+    download_dataset_by_spheres_v3(df, output_dir=data_dir, min_count=100)
+
+    # mapping_results = df['tag'].explode().value_counts()
+    # print("--- NEW CATEGORY DISTRIBUTION ---")
+    # print(mapping_results)
+
+    # data_dir = r'D:/datasets/GAIA_Agri'
+    # download_agri_dataset_by_tag(df, data_dir)
+
+    # df_universe = df[df['found_subspheres'].map(len) > 0].copy()
+    # print(f"Total images being sent to downloader: {len(df_universe)}")
+    # download_agri_master_dataset(df_universe)
+
+    for sphere in df['earth_sphere'].unique():
+        print(f"\n--- SAMPLE TAGS FOR: {sphere} ---")
+        # Sample 10 random images from this sphere
+        samples = df[df['earth_sphere'] == sphere]['tag'].sample(min(30, len(df))).tolist()
+        for i, tags in enumerate(samples):
+            print(f"{i + 1}: {tags}")

@@ -1,0 +1,9 @@
+_target_: src.data.rsicd_datamodule.RSICDDataModule
+data_dir: "/home/antonio/projects/mamba-gaia-ir/data/RSICD"
+batch_size: 512 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
+num_workers: 4
+pin_memory: True
+max_length: 32
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: gpt2

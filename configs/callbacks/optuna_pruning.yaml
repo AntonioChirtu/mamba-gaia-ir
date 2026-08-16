@@ -1,0 +1,6 @@
+optuna_pruning:
+  _target_: optuna.integration.PyTorchLightningPruningCallback
+  # This MUST match the metric Optuna is monitoring
+  monitor: "val/I2T_R1"
+  # This refers to the current trial object
+  trial: ${hydra:sweeper.trial}

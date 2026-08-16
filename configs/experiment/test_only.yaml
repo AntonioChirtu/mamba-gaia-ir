@@ -1,0 +1,47 @@
+# @package _global_
+
+# Test only experiment - skips training, runs validation and test
+
+defaults:
+  - override /data: gaia
+  - override /model: mamba2
+  - override /callbacks: default
+  - override /trainer: default
+
+tags: ["GAIA", "mamba2", "test_only"]
+
+seed: 42
+
+trainer:
+  min_epochs: 0
+  max_epochs: 0
+  log_every_n_steps: 1
+  check_val_every_n_epoch: 1
+  precision: 16-mixed
+  accumulate_grad_batches: 1
+
+model:
+  optimizer:
+    lr: 0.001
+
+data:
+  batch_size: 16
+  num_workers: 2
+
+logger:
+  csv:
+    _target_: lightning.pytorch.loggers.CSVLogger
+    save_dir: ${paths.output_dir}
+    name: "test_only_logs"
+  wandb:
+    tags: ${tags}
+    project: "lightning-hydra-template"
+    group: "test_only"
+
+callbacks:
+  early_stopping:
+    _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: "val/I2T_R1"
+    patience: 3
+    mode: "max"
+    min_delta: 0.001

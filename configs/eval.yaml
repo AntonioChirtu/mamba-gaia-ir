@@ -15,4 +15,4 @@ task_name: "eval"
 tags: ["dev"]
 
 # passing checkpoint path is necessary for evaluation
-ckpt_path: ???
+ckpt_path: "/home/antonio/projects/mamba-gaia-ir/logs/train/runs/2026-04-28_17-16-04/checkpoints/epoch_079.ckpt"

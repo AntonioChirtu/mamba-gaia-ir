@@ -1,0 +1,57 @@
+# @package _global_
+
+# Full training experiment for Mamba2 model - 100 epochs
+
+defaults:
+  - override /data: gaia
+  - override /model: mamba2
+  - override /callbacks: default
+  - override /trainer: default
+
+tags: ["GAIA", "mamba2", "full_training"]
+
+seed: 42
+
+trainer:
+  min_epochs: 1
+  max_epochs: 100
+  log_every_n_steps: 50
+  check_val_every_n_epoch: 10  # Validation every 10 epochs
+  precision: 16-mixed
+  accumulate_grad_batches: 1
+
+model:
+  optimizer:
+    lr: 0.001
+    weight_decay: 0.01
+  scheduler:
+    _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+    _partial_: true
+    mode: max
+    factor: 0.1
+    patience: 10
+
+logger:
+  csv:
+    _target_: lightning.pytorch.loggers.CSVLogger
+    save_dir: ${paths.output_dir}
+    name: "mamba2_full_logs"
+  wandb:
+    tags: ${tags}
+    project: "lightning-hydra-template"
+    group: "mamba2_full"
+
+callbacks:
+  early_stopping:
+    _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: "train/T2I_R1"  # Monitor training metric since validation runs every 10 epochs
+    patience: 20
+    mode: "max"
+    min_delta: 0.001
+  model_checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    monitor: "train/T2I_R1"
+    mode: "max"
+    save_top_k: 3
+    save_last: true
+    filename: "epoch-{epoch:02d}-trainT2I_R1-{train/T2I_R1:.3f}"

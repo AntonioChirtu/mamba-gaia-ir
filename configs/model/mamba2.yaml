@@ -3,20 +3,56 @@ _target_: src.models.mamba2_module.Mamba2LitModule
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 0.001
+  lr: 0.0001 # was 10x smaller
   weight_decay: 0.0
 
 # TODO: replace with Cosine Decay with Warmup
 scheduler:
   _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
   _partial_: true
-  mode: min
+  mode: max  # Since we want to maximize recall metrics
   factor: 0.1
   patience: 10
 
-net:
+#image_net:
+#  _target_: src.models.components.pretrained_vision.Mamba2WithPretrainedVision
+#  vision_encoder:
+#    _target_: src.models.components.pretrained_vision.PretrainedVisionEncoder
+#    backbone: vit_b32  # Options: resnet50, resnet101, vit_b16
+#    pretrained: true
+#    feature_dim: 2048
+#    d_model: 128
+#    freeze_backbone: false
+#  mamba2_model:
+#    _target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
+#    d_model: 128
+#    d_state: 32
+#    d_conv: 4
+#    expand: 2
+#    headdim: 8
+#  d_model: 128
+
+
+image_net:
+  _target_: src.models.components.vit_optimized.ViTOnlySimpleOptimized
+  backbone: vit_b16
+  pretrained: true
+  d_model: 128
+  freeze_backbone: false  # Fine-tune for faster adaptation
+  use_layer_norm: true
+  dropout: 0.1
+
+#image_net:
+#  _target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
+#  d_model: 128
+#  d_state: 32
+#  d_conv: 4
+#  expand: 2
+#  headdim: 8
+
+text_net:
   _target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
-  d_model: 128 # !!! Change also in mamba2_module
+  d_model: 128
   d_state: 32
   d_conv: 4
   expand: 2

@@ -1,0 +1,16 @@
+_target_: src.data.gaia_datamodule.GAIADataModule #TODO
+data_dir: ${paths.data_dir}
+batch_size: 128 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
+train_val_test_split: [0.8, 0.2, 0]
+num_workers: 4
+pin_memory: True
+max_length: 77
+#tokenizer:
+#  path: "eleutherai/gpt-neox-20b"
+#  padding_side: "left"
+#  max_length: 2048
+#  truncation: true
+
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: eleutherai/gpt-neox-20b

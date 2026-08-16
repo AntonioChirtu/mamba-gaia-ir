@@ -1,0 +1,39 @@
+_target_: src.models.mamba2_module.Mamba2LitModule
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.001
+  weight_decay: 0.0
+
+# TODO: replace with Cosine Decay with Warmup
+scheduler:
+  _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+  _partial_: true
+  mode: min
+  factor: 0.1
+  patience: 10
+
+# ViT for images (no Mamba)
+image_net:
+  _target_: src.models.components.vit_only.ViTOnlySimple
+  backbone: vit_b16  # Switch back to Base which works correctly
+  pretrained: true
+  d_model: 256  # Increase d_model to compensate for smaller backbone
+  freeze_backbone: false  # Freeze backbone to save memory
+
+# Common parameters
+d_model: 128  # Text model d_model
+image_d_model: 256  # Image model d_model
+
+# Mamba for text only
+text_net:
+  _target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
+  d_model: 128
+  d_state: 32
+  d_conv: 4
+  expand: 2
+  headdim: 8
+
+# compile model for faster training with pytorch 2.0
+compile: false

@@ -1,0 +1,57 @@
+_target_: src.models.mamba3_module.Mamba3LitModule
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.000001              # 0.0001 # was 10x smaller
+  weight_decay: 0.05
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+  _partial_: true
+  mode: max  # Since we want to maximize recall metrics
+  factor: 0.1
+  patience: 10
+#
+#scheduler:
+#  _target_: transformers.get_cosine_schedule_with_warmup
+#  _partial_: true
+#  num_warmup_steps: 500  # Adjust based on your steps/epoch
+#  num_training_steps: 6000 # Total steps for your run
+
+
+image_net:
+  _target_: src.models.components.vit_custom_multiscale_augmentation.ViTOnlySimpleOptimized
+  backbone: vit_b32
+  pretrained: true
+  d_model: 256
+  freeze_backbone: false  # Fine-tune for faster adaptation, unfreezes just last 4 layers
+  use_layer_norm: true
+  dropout: 0.2 
+
+#image_net:
+#  _target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
+#  d_model: 128
+#  d_state: 32
+#  d_conv: 4
+#  expand: 2
+#  headdim: 8
+
+# Latest edit: d_model -> 768, n_layers -> 6
+# Added multi-layer Mamba3
+# Added actual dropout
+
+text_net:
+  _target_: src.models.components.mamba_ssm_local.modules.mamba3.Mamba3
+  d_model: 768
+  d_state: 256
+  d_conv: 4
+  expand: 2
+  headdim: 16
+  n_layers: 1
+  dropout: 0.2
+
+# compile model for faster training with pytorch 2.0
+compile: false
+
+logit_scale_init: 0.07  # Tune this between 0.01 and 0.2

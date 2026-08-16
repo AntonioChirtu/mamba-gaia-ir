@@ -1,0 +1,52 @@
+# @package _global_
+
+# Fast training configuration for ViT + Mamba
+# to execute this experiment run:
+# python train.py experiment=vit_fast_training model=vit_mamba_fast
+
+defaults:
+  - override /data: gaia
+  - override /model: vit_mamba_fast
+  - override /callbacks: default
+  - override /trainer: default
+
+tags: ["GAIA", "vit_b16", "fast_training"]
+
+seed: 12345
+
+trainer:
+  min_epochs: 1
+  max_epochs: 50  # Extended from 30 to 50 epochs
+  gradient_clip_val: 1.0
+  log_every_n_steps: 5
+  check_val_every_n_epoch: 1
+  precision: 16-mixed  # Mixed precision for speed
+  accumulate_grad_batches: 1  # No accumulation for faster updates
+
+model:
+  optimizer:
+    lr: 0.003  # Even higher learning rate for ViT fine-tuning
+    weight_decay: 0.01
+
+data:
+  batch_size: 32  # Larger batch size for faster convergence
+  num_workers: 4
+
+logger:
+  csv:
+    _target_: lightning.pytorch.loggers.CSVLogger
+    save_dir: ${paths.output_dir}
+    name: "vit_fast_logs"
+  wandb:
+    tags: ${tags}
+    project: "lightning-hydra-template"
+    group: "vit_fast"
+    entity: "mihail-chirtu-polytechnica-university-of-bucharest"
+
+callbacks:
+  early_stopping:
+    _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: "val/I2T_R1"
+    patience: 10
+    mode: "max"
+    min_delta: 0.001

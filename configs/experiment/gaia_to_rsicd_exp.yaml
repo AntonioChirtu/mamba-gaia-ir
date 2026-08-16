@@ -1,0 +1,23 @@
+# @package _global_
+
+# to execute this experiment run:
+# python train.py experiment=example
+
+defaults:
+  - override /data: rsicd
+  - override /model: mamba3
+  - override /callbacks: default
+  - override /trainer: default
+
+# all parameters below will be merged with parameters from default configurations set above
+# this allows you to overwrite only specified parameters
+
+tags: ["rsicd", "mamba3"]
+
+seed: 12345
+
+trainer:
+  min_epochs: 10
+  max_epochs: 100
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: "norm"

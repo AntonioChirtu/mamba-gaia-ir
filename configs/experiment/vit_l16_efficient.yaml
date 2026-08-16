@@ -1,0 +1,49 @@
+# @package _global_
+
+# Memory-efficient configuration for ViT-Large
+# to execute this experiment run:
+# python train.py experiment=vit_l16_efficient model=vit_mamba_simple
+
+defaults:
+  - override /data: gaia
+  - override /model: vit_mamba_simple
+  - override /callbacks: default
+  - override /trainer: default
+
+tags: ["GAIA", "vit_l16", "memory_efficient"]
+
+seed: 12345
+
+trainer:
+  min_epochs: 1
+  max_epochs: 50
+  gradient_clip_val: 0.5
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 1
+  # Enable mixed precision to save memory
+  precision: 16
+  # Accumulate gradients to simulate larger batch size
+  accumulate_grad_batches: 2
+
+model:
+  optimizer:
+    lr: 0.0001  # Lower learning rate for frozen backbone
+  # ViT-Large with frozen backbone to save memory
+  image_net:
+    freeze_backbone: true  # CRITICAL: Freeze backbone
+
+data:
+  batch_size: 16  # Reduce batch size for ViT-Large
+  num_workers: 2  # Reduce workers to save memory
+
+logger:
+  csv:
+    _target_: lightning.pytorch.loggers.CSVLogger
+    save_dir: ${paths.output_dir}
+    name: "vit_l16_logs"
+  wandb:
+    tags: ${tags}
+    group: "vit_l16"
+
+callbacks:
+  early_stopping: null  # Disable early stopping for longer training
