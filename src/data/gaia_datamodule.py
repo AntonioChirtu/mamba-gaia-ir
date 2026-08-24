@@ -1,17 +1,15 @@
 import os
 import json
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Optional, Tuple, List
 
 import torch
 from lightning import LightningDataModule
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import transforms
 from PIL import Image
-from transformers import AutoTokenizer
 import random
 
 from omegaconf import DictConfig
-from hydra.utils import instantiate
 
 # Standard for many base Mamba models
 Image.MAX_IMAGE_PIXELS = None
@@ -33,7 +31,6 @@ class ResizeAndPad:
         new_h = int(h * ratio)
 
         # 2. Resize to the new dimensions
-        # Using a tuple (new_h, new_w) avoids the size/max_size conflict
         img = F.resize(img, (new_h, new_w), interpolation=Image.Resampling.LANCZOS)
 
         # 3. Calculate padding to get to exactly 224x224
@@ -47,73 +44,48 @@ class ResizeAndPad:
 
 
 class GAIADataset(Dataset):
-    """Custom Dataset for GAIA Information Retrieval."""
+    """Custom Dataset for GAIA Information Retrieval.
+    
+    Each record is ``(image_path, captions)`` where ```captions`` is the list of
+    synthetic captions GAIA provides per image. During training, a caption is
+    sampled at random each epoch (free text-side augmentation); during
+    validation/testing the first caption is used deterministically
+    """
 
-    def __init__(self, root_dir: str, tokenizer: Any, transform: Optional[Any] = None, max_length=77):
-        self.root_dir = root_dir
+    def __init__(
+        self,
+        records: List[Tuple[str, List[str]]],
+        tokenizer: Any, 
+        transform: Optional[Any] = None, 
+        max_length: int = 128,
+        is_training: bool = true
+    ):
+        self.records = records
         self.transform = transform
-        self.tokenizer = tokenizer  # Integrated tokenizer
-        self.data_pairs = []
-        self.is_training = True
+        self.tokenizer = tokenizer
 
         self.max_length = max_length
-
-        if not os.path.exists(root_dir):
-            raise FileNotFoundError(f"Root directory {root_dir} does not exist.")
-
-        for big_class in sorted(os.listdir(root_dir)):
-            big_class_path = os.path.join(root_dir, big_class)
-            if not os.path.isdir(big_class_path): continue
-
-            for sub_class in sorted(os.listdir(big_class_path)):
-                sub_class_path = os.path.join(big_class_path, sub_class)
-                metadata_path = os.path.join(sub_class_path, "metadata.json")
-
-                if os.path.isfile(metadata_path):
-                    with open(metadata_path, 'r', encoding='utf-8') as f:
-                        metadata_list = json.load(f)
-                    for item in metadata_list:
-                        caption = item["captions"][0]
-                        img_rel_path = item["image_path"]
-                        full_img_path = os.path.join(sub_class_path, img_rel_path)
-                        if os.path.exists(full_img_path):
-                            self.data_pairs.append((full_img_path, caption))
+        self.is_training = is_training
 
     def __len__(self):
-        return len(self.data_pairs)
+        return len(self.records)
 
     def set_train(self, mode: bool):
         self.is_training = mode
 
+    def _pick_caption(self, captions: List[str]) -> str:
+        if not captions:
+            return ""
+        if self.is_training:
+            return random.choice(captions)
+        return captions[0]
+
     def __getitem__(self, idx):
-        img_path, caption = self.data_pairs[idx]
+        img_path, captions = self.records[idx]
 
         try:
-            # 1. Open lazily
             with Image.open(img_path) as img:
                 image = img.convert("RGB")
-            #     w, h = img.size
-            #     th, tw = 512, 512
-            #
-            #     # Check if image is actually big enough for the crop
-            #     if w < tw or h < th:
-            #         # If it's too small, just resize the whole thing
-            #         image = img.resize((tw, th), resample=Image.Resampling.LANCZOS).convert("RGB")
-            #     else:
-            #         if self.is_training:
-            #             i = random.randint(0, h - th)
-            #             j = random.randint(0, w - tw)
-            #         else:
-            #             i = (h - th) // 2
-            #             j = (w - tw) // 2
-            #
-            #         # CROP AND CONVERT inside the 'with' block
-            #         # .convert("RGB") forces Pillow to actually read the pixels NOW
-            #         image = img.crop((j, i, j + tw, i + th)).convert("RGB")
-            #
-            # # Now 'image' is a fully loaded PIL object in RAM,
-            # # and it's safe that the file is closed.
-
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
             return self.__getitem__((idx + 1) % len(self))
@@ -121,65 +93,61 @@ class GAIADataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        # 2. Process Text (Tokenization)
-        # We return the tokens as a tensor so Lightning can move them to the GPU
+        caption = self._pick_caption(captions)
+
+        # Tokenize. attention_mask is returned so the model can pool the last
+        # non-pad toke (the tokenizer right-pads to max_length)
         tokens = self.tokenizer(
             caption,
             padding='max_length',
             truncation=True,
-            max_length=self.max_length,  # Standard for retrieval models like CLIP
-            return_tensors="pt"
+            max_length=self.max_length,
+            return_tensors="pt",
         )
 
-        # We squeeze(0) because return_tensors="pt" adds a batch dimension [1, seq_len]
-        # and the DataLoader will add its own batch dimension.
-        return image, tokens.input_ids.squeeze(0), caption
+        input_ids = tokens.input_ids.squeeze(0)
+        attention_mask = tokens.attention_mask.squeeze(0)
+        return image, input_ids, caption
 
 
 class GAIADataModule(LightningDataModule):
+    """ GAIA datamodule reading the preprocessed tree (``big_class/sub_class/metadata.json``).
+
+    Splits are assigned by GAIA's official spatio-temporally stratified membership:
+    each image's ``id`` is looked up in the official ``{train,val,test}_data.json``
+    files (``splits_dir``) and routed to the matching split. This avoids the
+    spatio-temporal leakage a random split would introduce and keeps results
+    comparable to the paper. If the official split files are not found, it falls
+    back to a deterministic per-id hash split using ``train_val_test_split``. 
+    """
     def __init__(
             self,
-            tokenizer: Any,  # Pass your model's tokenizer here
+            tokenizer: Any,
             data_dir: str = "data/GAIA",
+            splits_dir: Optional[str] = None,
             train_val_test_split: Tuple[float, float, float] = (0.8, 0.1, 0.1),
-            batch_size: int = 32,
+            batch_size: int = 128,
             num_workers: int = 4,
             pin_memory: bool = False,
-            max_length: int = 77,
+            max_length: int = 128,
     ) -> None:
         super().__init__()
 
         if isinstance(tokenizer, (dict, DictConfig)):
             from hydra.utils import instantiate
-            # This looks at the '_target_' in the config and builds the AutoTokenizer
             self.tokenizer = instantiate(tokenizer)
         else:
             self.tokenizer = tokenizer
 
+        # splits_dir defaults to data_dir (where the official JSONs are expected)
+        if splits_dir is None:
+            splits_dir = data_dir
+
         self.save_hyperparameters(logger=False, ignore=['tokenizer'])
 
-        self.max_length = max_length
-
-        # self.train_transforms = transforms.Compose([
-        #     transforms.RandomCrop((224, 224), pad_if_needed=True),
-        #     transforms.ToTensor(),
-        #     transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757])
-        # ])
-        #
-        # self.val_test_transforms = transforms.Compose([
-        #     transforms.CenterCrop((224, 224)),
-        #     transforms.ToTensor(),
-        #     transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757])
-        # ])
-
-        # --- UPDATED TRAINING TRANSFORMS ---
         self.train_transforms = transforms.Compose([
-            # scale=(0.08, 1.0) means it will take anywhere from 8% to 100% of the image area
-            # ratio=(0.75, 1.33) applies slight aspect ratio stretching for robustness
-            # transforms.Resize((224, 224)),
             transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.9, 1.1)),
-            # ResizeAndPad((224, 224)),
-            transforms.RandomHorizontalFlip(),  # Highly recommended to add this for free augmentation
+            transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
             transforms.RandomGrayscale(p=0.2),
             transforms.ToTensor(),
@@ -187,14 +155,9 @@ class GAIADataModule(LightningDataModule):
             transforms.RandomErasing(p=0.2),
         ])
 
-        # --- UPDATED VAL/TEST TRANSFORMS ---
         self.val_test_transforms = transforms.Compose([
-            # Crucial: Resize the whole image so the shortest edge is 256
-            # Then CenterCrop the middle 224x224.
-            # If you skip Resize, a 4000px image will just yield a tiny zoomed-in center dot.
             transforms.Resize(256),
             transforms.CenterCrop(224),
-            # transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757])
         ])
@@ -202,42 +165,112 @@ class GAIADataModule(LightningDataModule):
         self.data_train: Optional[Dataset] = None
         self.data_val: Optional[Dataset] = None
         self.data_test: Optional[Dataset] = None
+    
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+    def _scan_tree(self) -> List[str, str, List[str]]:
+        """Walk data_dir/big_class/sub_class/metadata.json -> [(id, full_path, caption)]."""
+        root = self.hparams.data_dir
+        if not os.path.exists(root):
+            raise FileNotFoundError(f"data_dir {root} does not exist.")
 
+        items: List[Tuple[str, str, List[str]]] = []
+        for big_class in sorted(os.listdir(root)):
+            big_class_path = os.path.join(root, big_class)
+            if not os.path.isdir(big_class_path):
+                continue
+            for sub_class in sorted(os.listdir(big_class_path)):
+                sub_class_path = os.path.join(big_class_path, sub_class)
+                metadata_path = os.path.join(sub_class_path, "metdata.json")
+                if not os.path.isfile(metadata_path):
+                    continue
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    metadata_list = json.load(f)
+                for item in metadata_list:
+                    captions = item.get("captions") or []
+                    if not captions:
+                        continue
+                    img_rel_path = item["image_path"]
+                    full_img_path = os.path.join(sub_class_path, img_rel_path)
+                    if not os.path.exists(full_img_path):
+                        continue
+                    # Route by the PARENT image id so sibling tiles (chips share
+                    # image_id/parent_id + captions) stay in the same official
+                    # split - a random split would leak siblings across train/val
+                    _id = str(item.get("image_id")
+                                or item.get("parent_id")
+                                or os.path.splitext(os.path.basename(img_rel_path))[0])
+                    items.append((_id, full_img_path, captions))
+        return items
+
+    def _load_official_split_map(self) -> dict:
+        """Return {id: 'train'|'val'|'test'} from official JSONs, or {} if unavailable."""
+        id_to_split: dict = {}
+        for name in ("train", "val", "test"):
+            path = os.path.join(self.hparams.splits_dir, f"{name}_data.json")
+            if not os.path.exitss(path):
+                return {}
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            for _id in d["id"]:
+                id_to_split[str(_id)] = name
+        return id_to_split
+
+    @staticmethod
+    def _deterministic_split(_id: str, fractions: Tuple[float, float, float]) -> str:
+        """Stable per-id hash split (fallback when official splits are absent)."""
+        import hashlib
+        h = int(hashlib.md5(_id.encode("utf-8")).hexdigest(), 16) % 1000 / 1000.0
+        tr, va, _ = fractions
+        if h < tr:
+            return "train"
+        if h < tr + va:
+            return "val"
+        return "test"
+
+    # ------------------------------------------------------------------ #
     def setup(self, stage: Optional[str] = None) -> None:
-        # 1. Create the Training version (Random Crop)
-        self.data_train_full = GAIADataset(
-            root_dir=self.hparams.data_dir,
-            tokenizer=self.tokenizer,
-            transform=self.train_transforms,
-            max_length=self.hparams.max_length
+        if self.data_train is not None:
+            return
+
+        items = self._scan_tree()
+        id_to_split = self._load_official_split_map()
+        using_official = bool(id_to_split)
+        if not using official:
+            print("Warning! Official split files not found in 
+                    f"{self.hparams.splits_dir}; falling back to a deterministic "
+                    "per-id hash split. Set `data.splits_dir` for paper-comparable splits.")
+
+        buckets = {"train": [], "val": [], "test": []}
+        n_unmatched = 0
+        for _id, full_path, captions in items:
+            if using_official:
+                splut = id_to_split.get(_id)
+                if split is None:
+                    n_unmatched += 1
+                    split = "train" # keep local images the official splits don't cover
+            else:
+                split = self._deterministic_split(_id, self.hparams.train_val_test_split)
+            buckets[split].append((full_path, captions))
+
+        for name in ("train", "val", "test"):
+            printf(f"GAIA {name}: {len(buckets[name])} image-text pairs"
+                    f"{' (official)' if using_official else ' (hash split)'}.")
+        if using_official and n_unmatched:
+            print(f"   ({n_unmatched} local images not in any official split -> routed to train)")
+
+        self.data_train = GAIADataset(
+            buckets["train"], self.tokenizer, self.train_transforms,
+            self.hparams.max_length, is_training=True,
         )
-        self.data_train_full.set_train(True)
-
-        # 2. Create the Eval version (Center Crop)
-        self.data_val_full = GAIADataset(
-            root_dir=self.hparams.data_dir,
-            tokenizer=self.tokenizer,
-            transform=self.val_test_transforms,
-            max_length=self.hparams.max_length
+        self.data_val = GAIADataset(
+            buckets["val"], self.tokenizer, self.val_test_transforms,
+            self.hparams.max_length, is_training=False,
         )
-        self.data_val_full.set_train(False)
-
-        # 3. Use the same seed to split them so the indices match!
-        dataset_size = len(self.data_train_full)
-        train_len = int(self.hparams.train_val_test_split[0] * dataset_size)
-        val_len = int(self.hparams.train_val_test_split[1] * dataset_size)
-        test_len = dataset_size - train_len - val_len
-
-        # Split the Training object for the train set
-        self.data_train, _, _ = random_split(
-            self.data_train_full, [train_len, val_len, test_len],
-            generator=torch.Generator().manual_seed(42)
-        )
-
-        # Split the Eval object for val and test
-        _, self.data_val, self.data_test = random_split(
-            self.data_val_full, [train_len, val_len, test_len],
-            generator=torch.Generator().manual_seed(42)
+        self.data_test = GAIADataset(
+            buckets["test"], self.tokenizer, self.val_test_transforms,
+            self.hparams.max_length, is_training=False,
         )
 
 
@@ -248,7 +281,7 @@ class GAIADataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=True,
-            persistent_workers=True,
+            persistent_workers=self.hparams.num_workers > 0,
             drop_last=True,
         )
 
@@ -259,8 +292,8 @@ class GAIADataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
-            persistent_workers=True,
-            drop_last=True,
+            persistent_workers=self.hparams.num_workers > 0,
+            drop_last=False,
         )
 
     def test_dataloader(self) -> DataLoader:

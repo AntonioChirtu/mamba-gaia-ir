@@ -167,46 +167,43 @@ class Mamba3LitModule(LightningModule):
         # Initialize test outputs storage
         self.test_outputs = {}
 
-    def forward(self, x: torch.Tensor, modality="image") -> torch.Tensor:
+    def forward(self, x: torch.Tensor, modality="image", attention_mask=None) -> torch.Tensor:
         """Perform a forward pass through the model `self.net`.
 
         :param x: A tensor of images.
         :return: A tensor of logits.
         """
         if modality == "image":
-            # Check if image_model is pretrained vision wrapper
-            if hasattr(self.image_model, 'vision_encoder'):
-                # Pretrained vision model: expects [B, 3, 224, 224]
-                out = self.image_model(x)
-            elif hasattr(self.image_model, 'vit'):
-                # ViT-only model: expects [B, 3, 224, 224]
-                # Set gradient checkpointing for memory efficiency
-                # self.image_model.vit.set_grad_checkpointing(True)
+            # Pretrained vision wrapper or ViT-only model; expects [B, 3, 224, 224]
+            if hasattr(self.image_model, 'vision_encoder') or hasattr(self.image_model, 'vit'):
                 out = self.image_model(x)
             else:
                 # Original patch embedding approach
-                # x is [batch, num_patches, patch_dim]
-                # [B, 3, 224, 224] -> [B, d_model, 14, 14] -> [B, d_model, 196]
-                x = self.patch_embed(x).flatten(2)
-                # -> [B, 196, d_model] (The 3D shape Mamba-2 expects!)
-                x = x.transpose(1, 2)
+                # [B, 3, 224, 224] -> [B, d_model, 14, 14] -> [B, 196, d_model]
+                x = self.patch_embed(x).flatten(2).transpose(1, 2)
                 out = self.image_model(x)
+            
+            #ViT-only models already return [B, dim]; Mamba-style returns [B, L, dim]
+            if out.dim() == 3:
+                out = out[:, -1, :]
+            out = self.proj1(out)
         else:
-            # x is [batch, seq_len, word_dim]
-            # [B, seq_len] -> [B, seq_len, d_model]
+            # x is [B, seq_len] token_ids -> [B, seq_len, d_model]
             x = self.text_embed(x)
-            out = self.text_model(x)
+            out = self.text_model(x) # [B, L, d_model]
 
-        # 2. Global Pooling: Turn sequence into a single vector
-        # Mamba returns [batch, length, dim]. We average across length.
-        # For ViT-only models that already output pooled features, skip pooling
-        if out.dim() == 3:  # [B, seq_len, dim] - need pooling
-            out = out[:, -1, :]
-        # If out.dim() == 2, it's already [B, dim] - no pooling needed
-
-        # 3. Project to shared IR space
-        out = self.proj1(out) if modality == "image" else self.proj2(out)
-
+            if out.dim() == 3:
+                if attention_mask is not None:
+                    # Pool the last NON-PAD token (tokenizer right-pads), instead of
+                    # the last position which would be a PAD token.
+                    lengths = attention_mask.long().sum(dim=1) - 1 # [B]
+                    lengths = lengths.clamp(min=0)
+                    idx = lengths.view(-1, 1, 1).expand(-1, 1, out.size(-1))
+                    out = out.gather(1, idx).squeeze(1) # [B, d_model]
+                else:
+                    out = out[:, -1, :]
+            out = self.proj2(out)
+ 
         return out
 
     def on_train_start(self) -> None:
@@ -237,10 +234,10 @@ class Mamba3LitModule(LightningModule):
             - A tensor of target labels.
         """
 
-        images, texts = batch
+        images, texts, attention_mask = batch
 
         img_emb = self.forward(images, modality="image")
-        txt_emb = self.forward(texts, modality="text")
+        txt_emb = self.forward(texts, modality="text", attention_mask=attention_mask)
 
         img_emb = torch.nn.functional.normalize(img_emb, p=2, dim=-1)
         txt_emb = torch.nn.functional.normalize(txt_emb, p=2, dim=-1)
@@ -280,7 +277,7 @@ class Mamba3LitModule(LightningModule):
         :param batch_idx: The index of the current batch.
         :return: A tensor of losses between model predictions and targets.
         """
-        images, texts, _ = batch
+        images, texts, attention_mask, _ = batch
 
         # # Multiscale Augmentation Trigger
         # if batch_idx % 10 == 0:
@@ -296,7 +293,7 @@ class Mamba3LitModule(LightningModule):
         #     )
 
         # The model handles the embedding interpolation internally now!
-        loss, l_i2t, l_t2i, y = self.model_step((images, texts))
+        loss, l_i2t, l_t2i, y = self.model_step((images, texts, attention_mask))
 
         # Catch the NaN guard signal
         if loss is None:
@@ -331,12 +328,12 @@ class Mamba3LitModule(LightningModule):
         :param batch_idx: The index of the current batch.
         """
         # 1. Use your model_step for the loss (keep it consistent!)
-        images, texts, text_strings = batch
+        images, texts, attention_mask, text_strings = batch
         current_batch_size = images.shape[0]
 
         self.image_model.vit.image_size = self.base_size
 
-        loss, l_i2t, l_t2i, y = self.model_step((images, texts))
+        loss, l_i2t, l_t2i, y = self.model_step((images, texts, attention_mask))
 
         # If validation batch is broken, exit early to protect global metric tracking
         if loss is None:
@@ -354,7 +351,7 @@ class Mamba3LitModule(LightningModule):
 
         # 2. Extract and store embeddings for Global Eval
         img_emb = self.forward(images, modality="image")
-        txt_emb = self.forward(texts, modality="text")
+        txt_emb = self.forward(texts, modality="text", attention_mask=attention_mask)
 
         self.val_outputs['img_embs'].append(img_emb.cpu())
         self.val_outputs['txt_embs'].append(txt_emb.cpu())
