@@ -3,7 +3,7 @@ _target_: src.models.mamba3_module.Mamba3LitModule
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 0.000001              # 0.0001 # was 10x smaller
+  lr: 0.0001              # 0.0001 # was 10x smaller
   weight_decay: 0.05
 
 scheduler:

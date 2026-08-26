@@ -1,4 +1,5 @@
 import os
+import glob
 import json
 from typing import Any, Optional, Tuple, List
 
@@ -15,6 +16,47 @@ from omegaconf import DictConfig
 Image.MAX_IMAGE_PIXELS = None
 
 import torchvision.transforms.functional as F
+
+
+SPHERE_ANCORS = {
+        'Atmosphere': ['dust_storm', 'cyclon', 'typhoon', 'hurricane', 'tornado', 'smoke_plume', 'aerosol', 'cloud',
+                       'ash', 'haze', 'meteorology', 'weather_pattern'],
+        'Hydrosphere': ['water', 'ocean', 'sea', 'river', 'lake', 'flood', 'delta', 'estuar', 'phytoplankton', 'algae',
+                        'marine', 'coast', 'reef', 'reservoir', 'currents', 'hydrology', 'tidal'],
+        'Biosphere': ['agri', 'farm', 'crop', 'forest', 'veget', 'plant', 'fire', 'burn', 'wildfire', 'ndvi', 'paddy',
+                      'tree', 'leaf', 'flora', 'harvest', 'deforest', 'ecology', 'habitat', 'irrigat', 'cultiv',
+                      'plantation', 'orchard'],
+        'Cryosphere': ['ice', 'snow', 'glacier', 'polar', 'arctic', 'freeze', 'frost', 'permafrost', 'antarct',
+                       'iceberg', 'shelf', 'meltwater'],
+        'Geosphere': ['geology', 'mining', 'volcan', 'earthq', 'soil', 'mountain', 'topography', 'urban', 'city',
+                      'plateau', 'desert', 'land_use', 'land_management', 'geography']
+    }
+
+def classify_to_sphere(image_tags):
+    tag_blob = " ".join([str(t).lower() for t in image_tags])
+
+    scores = {sphere: 0 for sphere in SPHERE_ANCORS}
+
+    for sphere, stems in SPHERE_ANCORS.items():
+        for stem in stems:
+            if stem in tag_blob:
+                scores[sphere] += 2
+
+                # --- STRATEGIC WEIGHTING ---
+    if scores['Biosphere'] > 0: scores['Biosphere'] += 5  # Maximum protection for your top interest
+    if scores['Hydrosphere'] > 0: scores['Hydrosphere'] += 2
+    if scores['Atmosphere'] > 0: scores['Atmosphere'] += 1
+
+    # Geosphere Tax: Only wins if it's the ONLY clear signal
+    if scores['Geosphere'] > 0: scores['Geosphere'] -= 2
+
+    top_sphere = max(scores, key=scores.get)
+
+    if scores[top_sphere] <= 0:
+        if any(c in tag_blob for c in ['cold', 'winter', 'degree']):
+            return 'Cryosphere'
+        return 'Geosphere'
+    return top_sphere
 
 
 class ResizeAndPad:
@@ -58,7 +100,7 @@ class GAIADataset(Dataset):
         tokenizer: Any, 
         transform: Optional[Any] = None, 
         max_length: int = 128,
-        is_training: bool = true
+        is_training: bool = True
     ):
         self.records = records
         self.transform = transform
@@ -107,25 +149,21 @@ class GAIADataset(Dataset):
 
         input_ids = tokens.input_ids.squeeze(0)
         attention_mask = tokens.attention_mask.squeeze(0)
-        return image, input_ids, caption
+        return image, input_ids, attention_mask, caption
 
 
 class GAIADataModule(LightningDataModule):
-    """ GAIA datamodule reading the preprocessed tree (``big_class/sub_class/metadata.json``).
-
-    Splits are assigned by GAIA's official spatio-temporally stratified membership:
-    each image's ``id`` is looked up in the official ``{train,val,test}_data.json``
-    files (``splits_dir``) and routed to the matching split. This avoids the
-    spatio-temporal leakage a random split would introduce and keeps results
-    comparable to the paper. If the official split files are not found, it falls
-    back to a deterministic per-id hash split using ``train_val_test_split``. 
+    """ GAIA datamodule reading img2dataset's ``files`` output layout:
+    ``data_dir/{train,val,test}/<shard>/<sample>.{png,json,txt}``, donwloaded directly
+    from GAIA's official json split files. Split membership
+    is therefore inherent to which folder a sample lives in (no id-matching needed).
+    Each sample's json sidecar carries its ``id``, ``captions``, ``tag`` and downloaded ``status``.
     """
     def __init__(
             self,
             tokenizer: Any,
             data_dir: str = "data/GAIA",
-            splits_dir: Optional[str] = None,
-            train_val_test_split: Tuple[float, float, float] = (0.8, 0.1, 0.1),
+            spheres: Optional[List[str]] = None,
             batch_size: int = 128,
             num_workers: int = 4,
             pin_memory: bool = False,
@@ -138,10 +176,6 @@ class GAIADataModule(LightningDataModule):
             self.tokenizer = instantiate(tokenizer)
         else:
             self.tokenizer = tokenizer
-
-        # splits_dir defaults to data_dir (where the official JSONs are expected)
-        if splits_dir is None:
-            splits_dir = data_dir
 
         self.save_hyperparameters(logger=False, ignore=['tokenizer'])
 
@@ -169,107 +203,66 @@ class GAIADataModule(LightningDataModule):
     # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #
-    def _scan_tree(self) -> List[str, str, List[str]]:
-        """Walk data_dir/big_class/sub_class/metadata.json -> [(id, full_path, caption)]."""
-        root = self.hparams.data_dir
-        if not os.path.exists(root):
-            raise FileNotFoundError(f"data_dir {root} does not exist.")
+    def _scan_split(self, split: str) -> List[Tuple[str, List[str]]]:
+        """Walk data_dir/<split>/<shard>/*.png -> [(full_path, caption)]."""
+        splits_dir = os.path.join(self.hparams.data_dir, split)
+        if not os.path.isdir(splits_dir):
+            raise FileNotFoundError(f"Split directory {root} does not exist.")
 
-        items: List[Tuple[str, str, List[str]]] = []
-        for big_class in sorted(os.listdir(root)):
-            big_class_path = os.path.join(root, big_class)
-            if not os.path.isdir(big_class_path):
+        records: List[Tuple[str, List[str]]] = []
+        n_failed, n_off_sphere = 0, 0
+        for img_path in sorted(glob.glob(os.path.join(splits_dir, "*", "*.png"))):
+            json_path = os.path.splitext(img_path)[0] + ".json"
+            if not os.path.isfile(json_path):
                 continue
-            for sub_class in sorted(os.listdir(big_class_path)):
-                sub_class_path = os.path.join(big_class_path, sub_class)
-                metadata_path = os.path.join(sub_class_path, "metdata.json")
-                if not os.path.isfile(metadata_path):
+            with open(json_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            
+            if meta.get("status") != "success":
+                n_failed += 1
+                continue
+
+            captions = meta.get("captions") or []
+            if not captions:
+                continue
+
+            if self.hparams.spheres:
+                sphere = classify_to_sphere(meta.get("tag") or [])
+                if sphere not in self.hparams.spheres:
+                    n_off_sphere += 1
                     continue
-                with open(metadata_path, "r", encoding="utf-8") as f:
-                    metadata_list = json.load(f)
-                for item in metadata_list:
-                    captions = item.get("captions") or []
-                    if not captions:
-                        continue
-                    img_rel_path = item["image_path"]
-                    full_img_path = os.path.join(sub_class_path, img_rel_path)
-                    if not os.path.exists(full_img_path):
-                        continue
-                    # Route by the PARENT image id so sibling tiles (chips share
-                    # image_id/parent_id + captions) stay in the same official
-                    # split - a random split would leak siblings across train/val
-                    _id = str(item.get("image_id")
-                                or item.get("parent_id")
-                                or os.path.splitext(os.path.basename(img_rel_path))[0])
-                    items.append((_id, full_img_path, captions))
-        return items
+            
+            records.append((img_path, captions))
 
-    def _load_official_split_map(self) -> dict:
-        """Return {id: 'train'|'val'|'test'} from official JSONs, or {} if unavailable."""
-        id_to_split: dict = {}
-        for name in ("train", "val", "test"):
-            path = os.path.join(self.hparams.splits_dir, f"{name}_data.json")
-            if not os.path.exitss(path):
-                return {}
-            with open(path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            for _id in d["id"]:
-                id_to_split[str(_id)] = name
-        return id_to_split
-
-    @staticmethod
-    def _deterministic_split(_id: str, fractions: Tuple[float, float, float]) -> str:
-        """Stable per-id hash split (fallback when official splits are absent)."""
-        import hashlib
-        h = int(hashlib.md5(_id.encode("utf-8")).hexdigest(), 16) % 1000 / 1000.0
-        tr, va, _ = fractions
-        if h < tr:
-            return "train"
-        if h < tr + va:
-            return "val"
-        return "test"
+        if n_failed:
+            print(f"GAIA {split}: skipped {n_failed} non-success downloads.")
+        if n_off_sphere:
+            print(f"GAIA {split}: skipped {n_off_sphere} images outside spheres={self.hparams.spheres}.")
+        return records
+                    
 
     # ------------------------------------------------------------------ #
     def setup(self, stage: Optional[str] = None) -> None:
         if self.data_train is not None:
             return
 
-        items = self._scan_tree()
-        id_to_split = self._load_official_split_map()
-        using_official = bool(id_to_split)
-        if not using official:
-            print("Warning! Official split files not found in 
-                    f"{self.hparams.splits_dir}; falling back to a deterministic "
-                    "per-id hash split. Set `data.splits_dir` for paper-comparable splits.")
+        train_records = self._scan_split("train")
+        val_records = self._scan_split("val")
+        test_records = self._scan_split("test")
 
-        buckets = {"train": [], "val": [], "test": []}
-        n_unmatched = 0
-        for _id, full_path, captions in items:
-            if using_official:
-                splut = id_to_split.get(_id)
-                if split is None:
-                    n_unmatched += 1
-                    split = "train" # keep local images the official splits don't cover
-            else:
-                split = self._deterministic_split(_id, self.hparams.train_val_test_split)
-            buckets[split].append((full_path, captions))
-
-        for name in ("train", "val", "test"):
-            printf(f"GAIA {name}: {len(buckets[name])} image-text pairs"
-                    f"{' (official)' if using_official else ' (hash split)'}.")
-        if using_official and n_unmatched:
-            print(f"   ({n_unmatched} local images not in any official split -> routed to train)")
+        for name, records in (("train", train_records), ("val", val_records), ("test", test_records)):
+            print(f"GAIA {name}: {len(records)} image-text pairs.")
 
         self.data_train = GAIADataset(
-            buckets["train"], self.tokenizer, self.train_transforms,
+            train_records, self.tokenizer, self.train_transforms,
             self.hparams.max_length, is_training=True,
         )
         self.data_val = GAIADataset(
-            buckets["val"], self.tokenizer, self.val_test_transforms,
+            val_records, self.tokenizer, self.val_test_transforms,
             self.hparams.max_length, is_training=False,
         )
         self.data_test = GAIADataset(
-            buckets["test"], self.tokenizer, self.val_test_transforms,
+            test_records, self.tokenizer, self.val_test_transforms,
             self.hparams.max_length, is_training=False,
         )
 

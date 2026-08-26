@@ -1,9 +1,9 @@
 _target_: src.data.gaia_datamodule.GAIADataModule
 data_dir: ${paths.data_dir}
-# Directory holding the official {train, val, test}_data.json split files.
-splits_dir: ${paths.root_dir}/data/GAIA
-# only used as fallback when official split files are not found
-train_val_test_split: [0.8, 0.2, 0]
+# Expects data_dir/{train,val/test}/<shared>/<sample>.{png,json,txt}
+# Set to a list (e.g., [Bioshphere, Hydrosphere, Atmosphere]) to restrict training to a
+# sphere subset, based on `tag`; null trains on all of GAIA
+spheres: null  
 batch_size: 128 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
 num_workers: 4
 pin_memory: True
