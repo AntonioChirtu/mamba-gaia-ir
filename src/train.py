@@ -12,7 +12,8 @@ import multiprocessing
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="optuna")
 
 
 
@@ -106,6 +107,19 @@ class SafePruningCallback(PyTorchLightningPruningCallback):
                 "Optuna trial not found in callback. Pruning is disabled for this run."
             )
 
+def trainable_report(m, prefix=""):
+    for name, module in m.named_children():
+        full_name = f"{prefix}.{name}" if prefix else name
+        params = list(module.parameters())
+        if not params:
+            continue
+        total = sum(p.numel() for p in params)
+        trainable = sum(p.numel() for p in params if p.requires_grad)
+        status = "TRAINABLE" if trainable == total else ("FROZEN" if trainable == 0 else "MIXED")
+        print(f"{full_name:50s} total={total:>10,} trainable={trainable:>10,} [{status}]")
+        if status == "MIXED":
+            trainable_report(module, full_name) 
+
 
 @task_wrapper
 def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -118,6 +132,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     :param cfg: A DictConfig configuration composed by Hydra.
     :return: A tuple with metrics and dict with all instantiated objects.
     """
+
     # set seed for random number generators in pytorch, numpy and python.random
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
@@ -127,6 +142,8 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model)
+
+    trainable_report(model)
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
@@ -167,7 +184,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if isinstance(cb, (PyTorchLightningPruningCallback, SafePruningCallback)):
             # If we found a trial, we update the callback
             # Note: Using getattr to safely get the monitor name
-            monitor = getattr(cb, "monitor", getattr(cb, "_monitor", "val/I2T_R1"))
+            monitor = getattr(cb, "monitor", getattr(cb, "_monitor", "val/mean_R1"))
 
             callbacks[i] = SafePruningCallback(trial, monitor)
 
