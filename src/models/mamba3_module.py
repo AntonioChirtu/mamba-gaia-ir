@@ -247,8 +247,8 @@ class Mamba3LitModule(LightningModule):
             self.logit_scale.clamp_(max=4.6052)
 
         # Scaling by temperature
-        # t = self.logit_scale.exp().clamp(max=100) # May not need
-        logits_i2t = (img_emb @ txt_emb.t()) * self.logit_scale.exp()
+        scale = self.logit_scale.exp().clamp(max=100)
+        logits_i2t = (img_emb @ txt_emb.t()) * scale
         logits_t2i = logits_i2t.t()
 
         y = torch.arange(logits_i2t.shape[0], device=logits_i2t.device)
@@ -260,7 +260,7 @@ class Mamba3LitModule(LightningModule):
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"WARNING: NaN/Inf loss detected! loss={loss.item()}")
             # Preserve device, dtype, and requires_grad from the original loss
-            loss = self.logit_scale * 0.0  # Uses a parameter → keeps grad_fn
+            loss = scale * 0.0  # Uses a parameter → keeps grad_fn
             l_i2t = torch.tensor(0.0)
             l_t2i = torch.tensor(0.0)
             y = torch.tensor(0.0)
@@ -373,7 +373,9 @@ class Mamba3LitModule(LightningModule):
         # 2. Normalize and compute Global Similarity Matrix
         all_img = torch.nn.functional.normalize(all_img, p=2, dim=-1)
         all_txt = torch.nn.functional.normalize(all_txt, p=2, dim=-1)
-        sim_matrix = all_img @ all_txt.t()
+        
+        scale = self.logit_scale.exp().clamp(max=100)
+        sim_matrix = scale * (all_img @ all_txt.t())
 
         num_samples = sim_matrix.shape[0]
         targets = torch.arange(num_samples, device=self.device)
@@ -390,6 +392,9 @@ class Mamba3LitModule(LightningModule):
             _, top_k_t2i = sim_matrix.t().topk(k, dim=1)
             r_t2i = (top_k_t2i == targets.view(-1, 1)).any(dim=1).float().mean()
             val_results[f"val/T2I_R{k}"] = r_t2i
+        
+        mean_r1 = 0.5 * (val_results["val/I2T_R1"] + val_results["val/T2I_R1"])
+        self.log("val/mean_R1", mean_r1, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
         # 4. Log all metrics to WandB/Progress Bar
         self.log_dict(val_results, prog_bar=True, sync_dist=True)
@@ -441,7 +446,7 @@ class Mamba3LitModule(LightningModule):
         #
         # return loss
         pass
-
+        
     def on_test_epoch_end(self) -> None:
         """Lightning hook that is called when a test epoch ends."""
         # for dataloader_idx, outputs in self.test_outputs.items():
@@ -533,7 +538,7 @@ class Mamba3LitModule(LightningModule):
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    "monitor": "train/T2I_R1",  # Use training metric since validation runs every 10 epochs
+                    "monitor": "val/mean_R1",  # Use training metric since validation runs every 10 epochs
                     "interval": "epoch",
                     "frequency": 1,
                 },
@@ -553,7 +558,7 @@ class Mamba3LitModule(LightningModule):
             num_samples_to_log = min(15, sim_matrix.shape[0])
 
             # Convert raw similarities to probabilities for readability
-            probs = torch.softmax(sim_matrix[:num_samples_to_log], dim=1)
+            probs = torch.softmax(sim_matrix[:num_samples_to_log].float(), dim=1)
             confidences, indices = probs.topk(1, dim=1)
 
             for i in range(num_samples_to_log):
