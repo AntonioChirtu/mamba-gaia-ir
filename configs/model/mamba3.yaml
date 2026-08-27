@@ -9,9 +9,9 @@ optimizer:
 scheduler:
   _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
   _partial_: true
-  mode: max  # Since we want to maximize recall metrics
+  mode: max 
   factor: 0.1
-  patience: 10
+  patience: 5
 
 image_net:
   _target_: src.models.components.vit_custom_multiscale_augmentation.ViTOnlySimpleOptimized

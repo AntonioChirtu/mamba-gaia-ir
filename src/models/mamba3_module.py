@@ -149,7 +149,6 @@ class Mamba3LitModule(LightningModule):
 
         self.val_batch_i2t_r1 = RetrievalRecallWrapper(k=1)
         self.val_batch_t2i_r1 = RetrievalRecallWrapper(k=1)
-        self.val_batch_loss = MeanMetric()
 
         # for averaging loss across batches
         self.train_loss = MeanMetric()
@@ -159,13 +158,14 @@ class Mamba3LitModule(LightningModule):
         # for tracking best so far validation accuracy
         self.val_i2t_r1_best = MaxMetric()
         self.val_t2i_r1_best = MaxMetric()
+        self.val_mean_r1_best = MaxMetric()
 
         self.test_r1 = RetrievalRecallWrapper(k=1)
         self.test_r5 = RetrievalRecallWrapper(k=5)
         self.test_r10 = RetrievalRecallWrapper(k=10)
 
         # Initialize test outputs storage
-        self.test_outputs = {}
+        self.test_outputs = {'img_embs': [], 'txt_embs': [], 'raw_texts': []}
 
     def forward(self, x: torch.Tensor, modality="image", attention_mask=None) -> torch.Tensor:
         """Perform a forward pass through the model `self.net`.
@@ -218,12 +218,13 @@ class Mamba3LitModule(LightningModule):
         self.val_t2i_r5.reset()
         self.val_i2t_r1_best.reset()
         self.val_t2i_r1_best.reset()
+        self.val_mean_r1_best.reset()
         self.val_batch_i2t_r1.reset()
         self.val_batch_t2i_r1.reset()
 
     def model_step(
             self, batch: Tuple[torch.Tensor, torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Perform a single model step on a batch of data.
 
         :param batch: A batch of data (a tuple) containing the input tensor of images and target labels.
@@ -265,7 +266,7 @@ class Mamba3LitModule(LightningModule):
             l_t2i = torch.tensor(0.0)
             y = torch.tensor(0.0)
 
-        return loss, logits_i2t, logits_t2i, y
+        return loss, logits_i2t, logits_t2i, y, img_emb, txt_emb
 
     def training_step(
             self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
@@ -293,7 +294,7 @@ class Mamba3LitModule(LightningModule):
         #     )
 
         # The model handles the embedding interpolation internally now!
-        loss, l_i2t, l_t2i, y = self.model_step((images, texts, attention_mask))
+        loss, l_i2t, l_t2i, y, _, _ = self.model_step((images, texts, attention_mask))
 
         # Catch the NaN guard signal
         if loss is None:
@@ -329,56 +330,100 @@ class Mamba3LitModule(LightningModule):
         """
         # 1. Use your model_step for the loss (keep it consistent!)
         images, texts, attention_mask, text_strings = batch
-        current_batch_size = images.shape[0]
 
         self.image_model.vit.image_size = self.base_size
 
-        loss, l_i2t, l_t2i, y = self.model_step((images, texts, attention_mask))
+        loss, l_i2t, l_t2i, y, img_emb, txt_emb = self.model_step((images, texts, attention_mask))
 
         # If validation batch is broken, exit early to protect global metric tracking
         if loss is None:
             return
 
-        self.val_loss(loss)
-
         self.val_batch_i2t_r1.update(l_i2t)
         self.val_batch_t2i_r1.update(l_t2i)
-        self.val_batch_loss.update(loss)
 
-        self.log("val/batch_I2T_R1", self.val_batch_i2t_r1.compute(), on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/batch_T2I_R1", self.val_batch_t2i_r1.compute(), on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/batch_loss", self.val_batch_loss, on_step=False, on_epoch=True)
+        if img_emb.ndim == 1:
+            img_emb = img_emb.unsqueeze(0)
+        if txt_emb.ndim == 1:
+            txt_emb = txt_emb.unsqueeze(0)
 
-        # 2. Extract and store embeddings for Global Eval
-        img_emb = self.forward(images, modality="image")
-        txt_emb = self.forward(texts, modality="text", attention_mask=attention_mask)
-
-        self.val_outputs['img_embs'].append(img_emb.cpu())
-        self.val_outputs['txt_embs'].append(txt_emb.cpu())
+        self.val_outputs["img_embs"].append(img_emb.detach().cpu())
+        self.val_outputs["txt_embs"].append(txt_emb.detach().cpu())
         self.val_outputs['raw_texts'].extend(text_strings)
 
-        self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=current_batch_size)
+        self.val_loss.update(loss)
+        self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
     def on_validation_epoch_end(self) -> None:
         "Lightning hook that is called when a validation epoch ends."
 
-        if not self.val_outputs['img_embs']:
+        # Safety guard
+        has_local = torch.tensor(
+            [bool(self.val_outputs["img_embs"])],
+            device=self.device,
+            dtype=torch.bool,
+        )
+        has_outputs = self.all_gather(has_local).flatten()
+
+        if not has_outputs.any():
             return
+        if not has_outputs.all():
+            raise RuntimeError("Some DDP ranks produced no validation embeddings")
 
-        # 1. Gather all validation data
-        all_img = torch.cat(self.val_outputs['img_embs'], dim=0).to(self.device)
-        all_txt = torch.cat(self.val_outputs['txt_embs'], dim=0).to(self.device)
-        all_strings = self.val_outputs['raw_texts']
+        # Gather tensors
+        local_img = torch.cat(self.val_outputs["img_embs"]).to(self.device)
+        local_txt = torch.cat(self.val_outputs["txt_embs"]).to(self.device)
 
-        # 2. Normalize and compute Global Similarity Matrix
+        local_n = torch.tensor([local_img.shape[0]], device=self.device)
+        rank_sizes = self.all_gather(local_n).flatten()
+
+        if not torch.all(rank_sizes == rank_sizes[0]):
+            raise RuntimeError(f"Unequal samples across ranks: {rank_sizes.tolist()}")
+
+        all_img = self.all_gather(local_img, sync_grads=False)
+        all_txt = self.all_gather(local_txt, sync_grads=False)
+
+        all_img = all_img.reshape(-1, local_img.shape[-1])
+        all_txt = all_txt.reshape(-1, local_txt.shape[-1])
+
+        if all_img.ndim != 2 or all_txt.ndim != 2:
+            raise RuntimeError(
+                f"Expected 2-D embeddings, got "
+                f"image={tuple(all_img.shape)}, text={tuple(all_txt.shape)}"
+            )
+
+        # Normalize and compute Global Similarity Matrix
         all_img = torch.nn.functional.normalize(all_img, p=2, dim=-1)
         all_txt = torch.nn.functional.normalize(all_txt, p=2, dim=-1)
         
-        scale = self.logit_scale.exp().clamp(max=100)
-        sim_matrix = scale * (all_img @ all_txt.t())
+        import torch.distributed as dist
 
-        num_samples = sim_matrix.shape[0]
-        targets = torch.arange(num_samples, device=self.device)
+        local_strings = list(self.val_outputs["raw_texts"])
+
+        if dist.is_available() and dist.is_initialized():
+            gathered_strings = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_strings, local_strings)
+            all_strings = [
+                text
+                for rank_strings in gathered_strings
+                for text in rank_strings
+            ]
+        else:
+            all_strings = local_strings
+        
+        sim_matrix = all_img @ all_txt.t()
+
+        if sim_matrix.ndim != 2:
+            raise RuntimeError(f"Expected 2-D similarity matrix, got {sim_matrix.shape}")
+
+        num_images, num_texts = sim_matrix.shape
+
+        if num_images != num_texts:
+            raise RuntimeError(
+                f"Diagonal targets require a square matrix, got "
+                f"{num_images} images and {num_texts} texts"
+            )
+        targets = torch.arange(num_images, device=sim_matrix.device)
 
         # 3. Calculate R@1, R@5, R@10 for both directions
         val_results = {}
@@ -393,20 +438,65 @@ class Mamba3LitModule(LightningModule):
             r_t2i = (top_k_t2i == targets.view(-1, 1)).any(dim=1).float().mean()
             val_results[f"val/T2I_R{k}"] = r_t2i
         
-        mean_r1 = 0.5 * (val_results["val/I2T_R1"] + val_results["val/T2I_R1"])
-        self.log("val/mean_R1", mean_r1, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        val_results["val/mean_R1"] = 0.5 * (val_results["val/I2T_R1"] + val_results["val/T2I_R1"])
 
         # 4. Log all metrics to WandB/Progress Bar
-        self.log_dict(val_results, prog_bar=True, sync_dist=True)
+        self.log_dict(
+            val_results,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
 
         # 5. Update "Best" trackers (Usually tracked via R1)
         self.val_i2t_r1_best(val_results["val/I2T_R1"])
         self.val_t2i_r1_best(val_results["val/T2I_R1"])
+        self.val_mean_r1_best(val_results["val/mean_R1"])
         self.log("val/I2T_R1_best", self.val_i2t_r1_best.compute(), sync_dist=True)
         self.log("val/T2I_R1_best", self.val_t2i_r1_best.compute(), sync_dist=True)
+        self.log("val/mean_R1_best", self.val_mean_r1_best.compute(), sync_dist=True)
+
+        batch_i2t_r1 = self.val_batch_i2t_r1.compute()
+        batch_t2i_r1 = self.val_batch_t2i_r1.compute()
+
+        # Ensure Lightning receives tensors rather than wrapper objects.
+        batch_i2t_r1 = torch.as_tensor(
+            batch_i2t_r1,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        batch_t2i_r1 = torch.as_tensor(
+            batch_t2i_r1,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        self.log_dict(
+            {
+                "val/batch_I2T_R1": batch_i2t_r1,
+                "val/batch_T2I_R1": batch_t2i_r1,
+            },
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=True,
+        )
 
         # 6. Save visual results table
-        self._save_results(sim_matrix, all_strings, phase="val")
+        if self.trainer.is_global_zero:
+            self._save_results(sim_matrix, all_strings, phase="val")
+
+        # # Diagnostic to check DistributedSampler repeating samples
+        # if self.trainer.is_global_zero:
+        #     dataset_size = len(self.trainer.datamodule.val_dataloader().dataset)
+        #     world_size = self.trainer.world_size
+
+        #     if dataset_size % world_size != 0:
+        #         print(
+        #             f"Warning: validation size {dataset_size} is not divisible "
+        #             f"by world size {world_size}; DDP may duplicate samples."
+        #         )
 
         # 7. Reset storage for the next epoch
         self.val_outputs = {'img_embs': [], 'txt_embs': [], 'raw_texts': []}
@@ -421,68 +511,145 @@ class Mamba3LitModule(LightningModule):
             labels.
         :param batch_idx: The index of the current batch.
         """
-        # images, texts = batch
-        #
-        # # 1. Get embeddings from your Mamba2 model
-        # img_emb = self.forward(images, modality="image")
-        # txt_emb = self.forward(texts, modality="text")
-        #
-        # # 2. Normalize (Retrieval is almost always done on the unit hypersphere)
-        # img_emb = torch.nn.functional.normalize(img_emb, p=2, dim=-1)
-        # txt_emb = torch.nn.functional.normalize(txt_emb, p=2, dim=-1)
-        #
-        # # 3. Optional: Calculate a batch-level loss for logging
-        # logits_i2t = (img_emb @ txt_emb.t()) * self.logit_scale.exp()
-        # y = torch.arange(logits_i2t.shape[0], device=logits_i2t.device)
-        # loss = F.cross_entropy(logits_i2t, y)
-        #
-        # # 4. Store Embeddings (following your dictionary pattern)
-        # if dataloader_idx not in self.test_outputs:
-        #     self.test_outputs[dataloader_idx] = {'img_embs': [], 'txt_embs': []}
-        #
-        # # Move to CPU to prevent GPU memory from filling up over 1000 samples
-        # self.test_outputs[dataloader_idx]['img_embs'].append(img_emb.cpu())
-        # self.test_outputs[dataloader_idx]['txt_embs'].append(txt_emb.cpu())
-        #
-        # return loss
-        pass
+
+        images, texts, attention_mask, text_strings = batch
+
+        self.image_model.vit.image_size = self.base_size
+
+        loss, l_i2t, l_t2i, y, img_emb, txt_emb = self.model_step((images, texts, attention_mask))
+
+        # If validation batch is broken, exit early to protect global metric tracking
+        if loss is None:
+            return
+
+        if img_emb.ndim == 1:
+            img_emb = img_emb.unsqueeze(0)
+        if txt_emb.ndim == 1:
+            txt_emb = txt_emb.unsqueeze(0)
+
+        self.test_outputs["img_embs"].append(img_emb.detach().cpu())
+        self.test_outputs["txt_embs"].append(txt_emb.detach().cpu())
+        self.test_outputs["raw_texts"].extend(text_strings)
+
         
     def on_test_epoch_end(self) -> None:
         """Lightning hook that is called when a test epoch ends."""
-        # for dataloader_idx, outputs in self.test_outputs.items():
-        #     # Concatenate all stored embeddings
-        #     all_img = torch.cat(outputs['img_embs'], dim=0)  # [N, 512]
-        #     all_txt = torch.cat(outputs['txt_embs'], dim=0)  # [N, 512]
-        #
-        #     # Compute the Global Similarity Matrix [N, N]
-        #     # With 1000 samples, we can safely do this on the GPU
-        #     all_img = all_img.to(self.device)
-        #     all_txt = all_txt.to(self.device)
-        #     sim_matrix = all_img @ all_txt.t()
-        #
-        #     # Calculate Recall@k
-        #     num_samples = sim_matrix.shape[0]
-        #     targets = torch.arange(num_samples, device=self.device)
-        #
-        #     test_results = {}
-        #     for k in [1, 5, 10]:
-        #         # Image to Text (Rows of the matrix)
-        #         _, top_k_i2t = sim_matrix.topk(k, dim=1)
-        #         r_i2t = (top_k_i2t == targets.view(-1, 1)).any(dim=1).float().mean()
-        #
-        #         # Text to Image (Columns of the matrix / Transpose)
-        #         _, top_k_t2i = sim_matrix.t().topk(k, dim=1)
-        #         r_t2i = (top_k_t2i == targets.view(-1, 1)).any(dim=1).float().mean()
-        #
-        #         test_results[f'test/I2T_R{k}_dl_{dataloader_idx}'] = r_i2t
-        #         test_results[f'test/T2I_R{k}_dl_{dataloader_idx}'] = r_t2i
-        #
-        #     # Log and use your save method
-        #     self.log_dict(test_results, prog_bar=True)
-        #     self._save_results(all_img, all_txt, dataloader_idx)
-        #
-        # self.test_outputs.clear()
-        pass
+
+        has_local = torch.tensor(
+            [bool(self.test_outputs["img_embs"])],
+            device=self.device,
+            dtype=torch.bool,
+        )
+        has_outputs = self.all_gather(has_local).flatten()
+
+        if not has_outputs.any():
+            return
+        if not has_outputs.all():
+            raise RuntimeError("Some DDP ranks produced no test embeddings")
+
+        local_img = torch.cat(self.test_outputs["img_embs"]).to(self.device)
+        local_txt = torch.cat(self.test_outputs["txt_embs"]).to(self.device)
+
+        if local_img.ndim != 2 or local_txt.ndim != 2:
+            raise RuntimeError(
+                f"Expected local [N, D] embeddings, got "
+                f"image={tuple(local_img.shape)}, "
+                f"text={tuple(local_txt.shape)}"
+            )
+
+        if local_img.shape[0] != local_txt.shape[0]:
+            raise RuntimeError(
+                f"Local image/text count mismatch: "
+                f"{local_img.shape[0]} vs {local_txt.shape[0]}"
+            )
+
+        local_n = torch.tensor([local_img.shape[0]], device=self.device)
+        rank_sizes = self.all_gather(local_n).flatten()
+
+        if not torch.all(rank_sizes == rank_sizes[0]):
+            raise RuntimeError(f"Unequal samples across ranks: {rank_sizes.tolist()}")
+
+        all_img = self.all_gather(local_img, sync_grads=False)
+        all_txt = self.all_gather(local_txt, sync_grads=False)
+
+        all_img = all_img.reshape(-1, local_img.shape[-1])
+        all_txt = all_txt.reshape(-1, local_txt.shape[-1])
+
+        if all_img.ndim != 2 or all_txt.ndim != 2:
+            raise RuntimeError(
+                f"Expected 2-D embeddings, got "
+                f"image={tuple(all_img.shape)}, text={tuple(all_txt.shape)}"
+            )
+
+        # 2. Normalize and compute Global Similarity Matrix
+        all_img = torch.nn.functional.normalize(all_img, p=2, dim=-1)
+        all_txt = torch.nn.functional.normalize(all_txt, p=2, dim=-1)
+        
+        import torch.distributed as dist
+
+        local_strings = list(self.test_outputs["raw_texts"])
+
+        if dist.is_available() and dist.is_initialized():
+            gathered_strings = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_strings, local_strings)
+            all_strings = [
+                text
+                for rank_strings in gathered_strings
+                for text in rank_strings
+            ]
+        else:
+            all_strings = local_strings
+        
+        sim_matrix = all_img @ all_txt.t()
+
+        if sim_matrix.ndim != 2:
+            raise RuntimeError(f"Expected 2-D similarity matrix, got {sim_matrix.shape}")
+
+        num_images, num_texts = sim_matrix.shape
+
+        if len(all_strings) != num_images:
+            raise RuntimeError(
+                f"Embedding/string count mismatch: "
+                f"{num_images} embeddings vs {len(all_strings)} strings"
+            )
+
+        if num_images != num_texts:
+            raise RuntimeError(
+                f"Diagonal targets require a square matrix, got "
+                f"{num_images} images and {num_texts} texts"
+            )
+        targets = torch.arange(num_images, device=sim_matrix.device)
+
+        # 3. Calculate R@1, R@5, R@10 for both directions
+        test_results = {}
+        for k in [1, 5, 10, 20]:
+            # --- Image to Text (Rows) ---
+            _, top_k_i2t = sim_matrix.topk(k, dim=1)
+            r_i2t = (top_k_i2t == targets.view(-1, 1)).any(dim=1).float().mean()
+            test_results[f"test/I2T_R{k}"] = r_i2t
+
+            # --- Text to Image (Columns) ---
+            _, top_k_t2i = sim_matrix.t().topk(k, dim=1)
+            r_t2i = (top_k_t2i == targets.view(-1, 1)).any(dim=1).float().mean()
+            test_results[f"test/T2I_R{k}"] = r_t2i
+        
+        test_results["test/mean_R1"] = 0.5 * (test_results["test/I2T_R1"] + test_results["test/T2I_R1"])
+
+        # 4. Log all metrics to WandB/Progress Bar
+        self.log_dict(
+            test_results,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+
+        # 6. Save visual results table
+        if self.trainer.is_global_zero:
+            self._save_results(sim_matrix, all_strings, phase="test")
+
+        # 7. Reset storage for the next epoch
+        self.test_outputs = {'img_embs': [], 'txt_embs': [], 'raw_texts': []}
 
     def setup(self, stage: str) -> None:
         """Lightning hook that is called at the beginning of fit (train + validate), validate,
