@@ -85,15 +85,15 @@ class Mamba3LitModule(LightningModule):
     """
 
     def __init__(
-            self,
-            image_net: torch.nn.Module,
-            text_net: torch.nn.Module,
-            optimizer: torch.optim.Optimizer,
-            scheduler: torch.optim.lr_scheduler,
-            compile: bool,
-            patch_size: int = 16,
-            vocab_size: int = 50277,
-            logit_scale_init: float = 0.07
+        self,
+        image_net: torch.nn.Module,
+        text_net: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler,
+        compile: bool,
+        patch_size: int = 16,
+        vocab_size: int = 50277,
+        logit_scale_init: float = 0.07,
     ) -> None:
         """Initialize a `Mamba3LitModule`.
 
@@ -128,9 +128,11 @@ class Mamba3LitModule(LightningModule):
         self.proj1 = torch.nn.Linear(image_net.d_model, 512)
         self.proj2 = torch.nn.Linear(text_net.d_model, 512)
 
-        self.logit_scale = torch.nn.Parameter(torch.ones([]) * torch.log(torch.tensor(1 / logit_scale_init)))
+        self.logit_scale = torch.nn.Parameter(
+            torch.ones([]) * torch.log(torch.tensor(1 / logit_scale_init))
+        )
 
-        self.val_outputs = {'img_embs': [], 'txt_embs': [], 'raw_texts': []}
+        self.val_outputs = {"img_embs": [], "txt_embs": [], "raw_texts": []}
 
         # TODO: Make more complicated contrastive loss?
         # loss function
@@ -165,9 +167,11 @@ class Mamba3LitModule(LightningModule):
         self.test_r10 = RetrievalRecallWrapper(k=10)
 
         # Initialize test outputs storage
-        self.test_outputs = {'img_embs': [], 'txt_embs': [], 'raw_texts': []}
+        self.test_outputs = {"img_embs": [], "txt_embs": [], "raw_texts": []}
 
-    def forward(self, x: torch.Tensor, modality="image", attention_mask=None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, modality="image", attention_mask=None
+    ) -> torch.Tensor:
         """Perform a forward pass through the model `self.net`.
 
         :param x: A tensor of images.
@@ -175,35 +179,37 @@ class Mamba3LitModule(LightningModule):
         """
         if modality == "image":
             # Pretrained vision wrapper or ViT-only model; expects [B, 3, 224, 224]
-            if hasattr(self.image_model, 'vision_encoder') or hasattr(self.image_model, 'vit'):
+            if hasattr(self.image_model, "vision_encoder") or hasattr(
+                self.image_model, "vit"
+            ):
                 out = self.image_model(x)
             else:
                 # Original patch embedding approach
                 # [B, 3, 224, 224] -> [B, d_model, 14, 14] -> [B, 196, d_model]
                 x = self.patch_embed(x).flatten(2).transpose(1, 2)
                 out = self.image_model(x)
-            
-            #ViT-only models already return [B, dim]; Mamba-style returns [B, L, dim]
+
+            # ViT-only models already return [B, dim]; Mamba-style returns [B, L, dim]
             if out.dim() == 3:
                 out = out[:, -1, :]
             out = self.proj1(out)
         else:
             # x is [B, seq_len] token_ids -> [B, seq_len, d_model]
             x = self.text_embed(x)
-            out = self.text_model(x) # [B, L, d_model]
+            out = self.text_model(x)  # [B, L, d_model]
 
             if out.dim() == 3:
                 if attention_mask is not None:
                     # Pool the last NON-PAD token (tokenizer right-pads), instead of
                     # the last position which would be a PAD token.
-                    lengths = attention_mask.long().sum(dim=1) - 1 # [B]
+                    lengths = attention_mask.long().sum(dim=1) - 1  # [B]
                     lengths = lengths.clamp(min=0)
                     idx = lengths.view(-1, 1, 1).expand(-1, 1, out.size(-1))
-                    out = out.gather(1, idx).squeeze(1) # [B, d_model]
+                    out = out.gather(1, idx).squeeze(1)  # [B, d_model]
                 else:
                     out = out[:, -1, :]
             out = self.proj2(out)
- 
+
         return out
 
     def on_train_start(self) -> None:
@@ -223,8 +229,15 @@ class Mamba3LitModule(LightningModule):
         self.val_batch_t2i_r1.reset()
 
     def model_step(
-            self, batch: Tuple[torch.Tensor, torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, batch: Tuple[torch.Tensor, torch.Tensor]
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Perform a single model step on a batch of data.
 
         :param batch: A batch of data (a tuple) containing the input tensor of images and target labels.
@@ -269,7 +282,7 @@ class Mamba3LitModule(LightningModule):
         return loss, logits_i2t, logits_t2i, y, img_emb, txt_emb
 
     def training_step(
-            self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
+        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
         """Perform a single training step on a batch of data from the training set.
 
@@ -306,9 +319,23 @@ class Mamba3LitModule(LightningModule):
 
         # update and log metrics
         self.train_loss(loss)
-        self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/I2T_R1", self.train_i2t_r1.compute(), on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train/T2I_R1", self.train_t2i_r1.compute(), on_step=False, on_epoch=True, prog_bar=True)
+        self.log(
+            "train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True
+        )
+        self.log(
+            "train/I2T_R1",
+            self.train_i2t_r1.compute(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+        )
+        self.log(
+            "train/T2I_R1",
+            self.train_t2i_r1.compute(),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+        )
 
         # return loss or backpropagation will fail
         return loss
@@ -321,7 +348,9 @@ class Mamba3LitModule(LightningModule):
         gc.collect()
         torch.cuda.empty_cache()
 
-    def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+    def validation_step(
+        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
+    ) -> None:
         """Perform a single validation step on a batch of data from the validation set.
 
         :param batch: A batch of data (a tuple) containing the input tensor of images and target
@@ -333,7 +362,9 @@ class Mamba3LitModule(LightningModule):
 
         self.image_model.vit.image_size = self.base_size
 
-        loss, l_i2t, l_t2i, y, img_emb, txt_emb = self.model_step((images, texts, attention_mask))
+        loss, l_i2t, l_t2i, y, img_emb, txt_emb = self.model_step(
+            (images, texts, attention_mask)
+        )
 
         # If validation batch is broken, exit early to protect global metric tracking
         if loss is None:
@@ -349,10 +380,17 @@ class Mamba3LitModule(LightningModule):
 
         self.val_outputs["img_embs"].append(img_emb.detach().cpu())
         self.val_outputs["txt_embs"].append(txt_emb.detach().cpu())
-        self.val_outputs['raw_texts'].extend(text_strings)
+        self.val_outputs["raw_texts"].extend(text_strings)
 
         self.val_loss.update(loss)
-        self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log(
+            "val/loss",
+            self.val_loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
 
     def on_validation_epoch_end(self) -> None:
         "Lightning hook that is called when a validation epoch ends."
@@ -395,7 +433,7 @@ class Mamba3LitModule(LightningModule):
         # Normalize and compute Global Similarity Matrix
         all_img = torch.nn.functional.normalize(all_img, p=2, dim=-1)
         all_txt = torch.nn.functional.normalize(all_txt, p=2, dim=-1)
-        
+
         import torch.distributed as dist
 
         local_strings = list(self.val_outputs["raw_texts"])
@@ -404,17 +442,17 @@ class Mamba3LitModule(LightningModule):
             gathered_strings = [None] * dist.get_world_size()
             dist.all_gather_object(gathered_strings, local_strings)
             all_strings = [
-                text
-                for rank_strings in gathered_strings
-                for text in rank_strings
+                text for rank_strings in gathered_strings for text in rank_strings
             ]
         else:
             all_strings = local_strings
-        
+
         sim_matrix = all_img @ all_txt.t()
 
         if sim_matrix.ndim != 2:
-            raise RuntimeError(f"Expected 2-D similarity matrix, got {sim_matrix.shape}")
+            raise RuntimeError(
+                f"Expected 2-D similarity matrix, got {sim_matrix.shape}"
+            )
 
         num_images, num_texts = sim_matrix.shape
 
@@ -437,8 +475,10 @@ class Mamba3LitModule(LightningModule):
             _, top_k_t2i = sim_matrix.t().topk(k, dim=1)
             r_t2i = (top_k_t2i == targets.view(-1, 1)).any(dim=1).float().mean()
             val_results[f"val/T2I_R{k}"] = r_t2i
-        
-        val_results["val/mean_R1"] = 0.5 * (val_results["val/I2T_R1"] + val_results["val/T2I_R1"])
+
+        val_results["val/mean_R1"] = 0.5 * (
+            val_results["val/I2T_R1"] + val_results["val/T2I_R1"]
+        )
 
         # 4. Log all metrics to WandB/Progress Bar
         self.log_dict(
@@ -486,6 +526,7 @@ class Mamba3LitModule(LightningModule):
         # 6. Save visual results table
         if self.trainer.is_global_zero:
             self._save_results(sim_matrix, all_strings, phase="val")
+            self._save_misc_metrics(sim_matrix, all_strings, phase="val")
 
         # # Diagnostic to check DistributedSampler repeating samples
         # if self.trainer.is_global_zero:
@@ -499,12 +540,17 @@ class Mamba3LitModule(LightningModule):
         #         )
 
         # 7. Reset storage for the next epoch
-        self.val_outputs = {'img_embs': [], 'txt_embs': [], 'raw_texts': []}
+        self.val_outputs = {"img_embs": [], "txt_embs": [], "raw_texts": []}
 
         self.val_batch_i2t_r1.reset()
         self.val_batch_t2i_r1.reset()
 
-    def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int, dataloader_idx: int = 0) -> None:
+    def test_step(
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor],
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
         """Perform a single test step on a batch of data from the test set.
 
         :param batch: A batch of data (a tuple) containing the input tensor of images and target
@@ -516,7 +562,9 @@ class Mamba3LitModule(LightningModule):
 
         self.image_model.vit.image_size = self.base_size
 
-        loss, l_i2t, l_t2i, y, img_emb, txt_emb = self.model_step((images, texts, attention_mask))
+        loss, l_i2t, l_t2i, y, img_emb, txt_emb = self.model_step(
+            (images, texts, attention_mask)
+        )
 
         # If validation batch is broken, exit early to protect global metric tracking
         if loss is None:
@@ -531,7 +579,6 @@ class Mamba3LitModule(LightningModule):
         self.test_outputs["txt_embs"].append(txt_emb.detach().cpu())
         self.test_outputs["raw_texts"].extend(text_strings)
 
-        
     def on_test_epoch_end(self) -> None:
         """Lightning hook that is called when a test epoch ends."""
 
@@ -584,7 +631,7 @@ class Mamba3LitModule(LightningModule):
         # 2. Normalize and compute Global Similarity Matrix
         all_img = torch.nn.functional.normalize(all_img, p=2, dim=-1)
         all_txt = torch.nn.functional.normalize(all_txt, p=2, dim=-1)
-        
+
         import torch.distributed as dist
 
         local_strings = list(self.test_outputs["raw_texts"])
@@ -593,17 +640,17 @@ class Mamba3LitModule(LightningModule):
             gathered_strings = [None] * dist.get_world_size()
             dist.all_gather_object(gathered_strings, local_strings)
             all_strings = [
-                text
-                for rank_strings in gathered_strings
-                for text in rank_strings
+                text for rank_strings in gathered_strings for text in rank_strings
             ]
         else:
             all_strings = local_strings
-        
+
         sim_matrix = all_img @ all_txt.t()
 
         if sim_matrix.ndim != 2:
-            raise RuntimeError(f"Expected 2-D similarity matrix, got {sim_matrix.shape}")
+            raise RuntimeError(
+                f"Expected 2-D similarity matrix, got {sim_matrix.shape}"
+            )
 
         num_images, num_texts = sim_matrix.shape
 
@@ -632,8 +679,10 @@ class Mamba3LitModule(LightningModule):
             _, top_k_t2i = sim_matrix.t().topk(k, dim=1)
             r_t2i = (top_k_t2i == targets.view(-1, 1)).any(dim=1).float().mean()
             test_results[f"test/T2I_R{k}"] = r_t2i
-        
-        test_results["test/mean_R1"] = 0.5 * (test_results["test/I2T_R1"] + test_results["test/T2I_R1"])
+
+        test_results["test/mean_R1"] = 0.5 * (
+            test_results["test/I2T_R1"] + test_results["test/T2I_R1"]
+        )
 
         # 4. Log all metrics to WandB/Progress Bar
         self.log_dict(
@@ -647,9 +696,10 @@ class Mamba3LitModule(LightningModule):
         # 6. Save visual results table
         if self.trainer.is_global_zero:
             self._save_results(sim_matrix, all_strings, phase="test")
+            self._save_misc_metrics(sim_matrix, all_strings, phase="test")
 
         # 7. Reset storage for the next epoch
-        self.test_outputs = {'img_embs': [], 'txt_embs': [], 'raw_texts': []}
+        self.test_outputs = {"img_embs": [], "txt_embs": [], "raw_texts": []}
 
     def setup(self, stage: str) -> None:
         """Lightning hook that is called at the beginning of fit (train + validate), validate,
@@ -663,19 +713,27 @@ class Mamba3LitModule(LightningModule):
 
         # --- DYNAMIC VOCABSIZE AUTO-PATCH ---
         # Look across to see if a trainer and a datamodule with a tokenizer exist
-        if stage == "fit":
-            if self.trainer and hasattr(self.trainer, "datamodule") and hasattr(self.trainer.datamodule, "tokenizer"):
-                datamodule_tokenizer = self.trainer.datamodule.tokenizer
-                actual_vocab_size = len(datamodule_tokenizer)
+        if (
+            stage == "fit"
+            and self.trainer
+            and hasattr(self.trainer, "datamodule")
+            and hasattr(self.trainer.datamodule, "tokenizer")
+        ):
+            datamodule_tokenizer = self.trainer.datamodule.tokenizer
+            actual_vocab_size = len(datamodule_tokenizer)
 
-                # Check if our current embedding layer is too small or mismatched
-                if self.text_embed.num_embeddings != actual_vocab_size:
-                    print(f"🔄 Auto-Patching Text Embedding Matrix: "
-                        f"{self.text_embed.num_embeddings} ➡️ {actual_vocab_size} rows "
-                        f"to match the data tokenizer.")
+            # Check if our current embedding layer is too small or mismatched
+            if self.text_embed.num_embeddings != actual_vocab_size:
+                print(
+                    f"🔄 Auto-Patching Text Embedding Matrix: "
+                    f"{self.text_embed.num_embeddings} ➡️ {actual_vocab_size} rows "
+                    f"to match the data tokenizer."
+                )
 
-                    # Re-initialize the embedding layer with the exact vocabulary shape required
-                    self.text_embed = torch.nn.Embedding(actual_vocab_size, self.text_embed.embedding_dim)
+                # Re-initialize the embedding layer with the exact vocabulary shape required
+                self.text_embed = torch.nn.Embedding(
+                    actual_vocab_size, self.text_embed.embedding_dim
+                )
 
         if self.hparams.compile and stage == "fit":
             self.image_model = torch.compile(self.image_model)
@@ -708,17 +766,20 @@ class Mamba3LitModule(LightningModule):
                     "monitor": "val/mean_R1",  # Use training metric since validation runs every 10 epochs
                     "interval": "epoch",
                     "frequency": 1,
-                },
-                "clip_gradients": True,          # Enable clipping
-                "gradient_clip_val": 1.0,        # Max norm for gradients
-                "gradient_clip_algorithm": "norm",  # Clip by norm (not value)
+                }
             }
         return {"optimizer": optimizer}
 
     def _save_results(self, sim_matrix, all_texts, phase="val"):
         """Logs a table to WandB showing what the model predicted."""
         if isinstance(self.logger, WandbLogger):
-            columns = ["Image_Index", "True_Caption", "Model_Top_Pick", "Confidence", "Correct"]
+            columns = [
+                "Image_Index",
+                "True_Caption",
+                "Model_Top_Pick",
+                "Confidence",
+                "Correct",
+            ]
             table = wandb.Table(columns=columns)
 
             # Look at the first 15 images to keep the WandB payload light
@@ -733,12 +794,96 @@ class Mamba3LitModule(LightningModule):
                 predicted_idx = indices[i].item()
                 predicted_caption = all_texts[predicted_idx]
                 conf = confidences[i].item()
-                is_correct = (predicted_idx == i)
+                is_correct = predicted_idx == i
 
                 table.add_data(i, true_caption, predicted_caption, conf, is_correct)
 
             # This will show up in WandB under the "val/predictions_sample" tab
             self.logger.experiment.log({f"{phase}/predictions_sample": table})
+
+        
+    @torch.no_grad()
+    def _save_misc_metrics(self, sim_matrix, all_texts, phase="val"):
+        if not isinstance(self.logger, WandbLogger):
+            return
+
+        num_candidates = sim_matrix.shape[1]
+        num_samples = min(15, sim_matrix.shape[0])
+
+        if len(all_texts) != num_candidates:
+            raise RuntimeError(
+                f"Expected {num_candidates} captions, got {len(all_texts)}"
+            )
+
+        query_sim = sim_matrix[:num_samples].float()
+
+        # Top-1 and top-2 cosine similarities
+        k = min(2, num_candidates)
+        top_scores, top_indices = query_sim.topk(k, dim=1)
+
+        top1_cosine = top_scores[:, 0]
+        top1_indices = top_indices[:, 0]
+
+        if k == 2:
+            top2_cosine = top_scores[:, 1]
+            cosine_margin = top1_cosine - top2_cosine
+        else:
+            top2_cosine = torch.full_like(top1_cosine, float("nan"))
+            cosine_margin = torch.full_like(top1_cosine, float("nan"))
+
+        # Diagonal is the correct caption under one-to-one pairing
+        query_indices = torch.arange(
+            num_samples,
+            device=sim_matrix.device,
+        )
+        true_cosine = query_sim[query_indices, query_indices]
+
+        # Rank of the true caption: 1 means correct top-1
+        true_rank = (
+            (query_sim > true_cosine[:, None]).sum(dim=1) + 1
+        )
+
+        # Temperature-scaled score, consistent with training logits
+        scale = self.logit_scale.detach().exp().clamp(max=100)
+        scaled_logits = scale * query_sim
+        probabilities = torch.softmax(scaled_logits, dim=1)
+        top1_softmax_score = probabilities.gather(
+            1, top1_indices[:, None]
+        ).squeeze(1)
+
+        columns = [
+            "Image_Index",
+            "True_Caption",
+            "Model_Top_Pick",
+            "True_Rank",
+            "Top1_Cosine",
+            "True_Cosine",
+            "Top2_Cosine",
+            "Cosine_Margin",
+            "Top1_Softmax_Score",
+            "Correct",
+        ]
+        table = wandb.Table(columns=columns)
+
+        for i in range(num_samples):
+            predicted_idx = top1_indices[i].item()
+
+            table.add_data(
+                i,
+                all_texts[i],
+                all_texts[predicted_idx],
+                true_rank[i].item(),
+                top1_cosine[i].item(),
+                true_cosine[i].item(),
+                top2_cosine[i].item(),
+                cosine_margin[i].item(),
+                top1_softmax_score[i].item(),
+                predicted_idx == i,
+            )
+
+        self.logger.experiment.log({
+            f"{phase}/predictions_sample": table
+        })
 
 
 if __name__ == "__main__":
