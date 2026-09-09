@@ -799,7 +799,7 @@ class Mamba3LitModule(LightningModule):
                 table.add_data(i, true_caption, predicted_caption, conf, is_correct)
 
             # This will show up in WandB under the "val/predictions_sample" tab
-            self.logger.experiment.log({f"{phase}/predictions_sample": table})
+            self.logger.experiment.log({f"{phase}/predictions_brief": table})
 
         
     @torch.no_grad()
@@ -882,7 +882,7 @@ class Mamba3LitModule(LightningModule):
             )
 
         self.logger.experiment.log({
-            f"{phase}/predictions_sample": table
+            f"{phase}/predictions_detailed": table
         })
 
 
