@@ -35,29 +35,3 @@ hydra:
       model.text_net.dropout: 0.2
       trainer.accumulate_grad_batches: 4
       seed: 12345
-
-    # MOVED: This is now at the correct level (under sweeper, not inside it)
-    # Actually, standard Hydra-Optuna plugin syntax usually expects it here:
-    # but some versions require it specifically formatted:
-    search_space: null
-
-    params:
-      # 1. Broaden LR search but keep it central
-      # model.optimizer.lr: tag(log, interval(1.2e-4, 2.5e-4))
-
-      # 3. Give Mamba more room to breathe with d_state
-      # model.text_net.d_state: choice(32, 64)
-
-      # 4. Critical for Retrieval: The "Context Window"
-      # data.max_length: choice(128, 256)
-
-      # model.text_net.dropout: interval(0.15, 0.3)
-
-      # trainer.accumulate_grad_batches: choice(2, 4, 8)
-
-      model.optimizer.lr: 1.5e-4          # Fixed value (no choice)
-      model.text_net.d_state: 32           # Fixed value
-      data.max_length: 128                # Fixed value
-      model.text_net.dropout: 0.2          # Fixed value
-      trainer.accumulate_grad_batches: 4  # Fixed value
-      seed: choice(12345, 42, 1337)       # Only this uses choice()
