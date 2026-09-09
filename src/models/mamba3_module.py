@@ -125,7 +125,10 @@ class Mamba3LitModule(LightningModule):
         # 2. Text Embedding: Turns [B, 77] -> [B, 77, d_model]
         self.text_embed = torch.nn.Embedding(vocab_size, text_net.d_model)
 
-        self.proj1 = torch.nn.Linear(image_net.d_model, 512)
+        self.proj1 = (
+            torch.nn.Identity()
+            if image_net.d_model == 512
+            else torch.nn.Linear(image_net.d_model, 512))
         self.proj2 = torch.nn.Linear(text_net.d_model, 512)
 
         self.logit_scale = torch.nn.Parameter(

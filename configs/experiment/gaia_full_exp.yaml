@@ -21,5 +21,5 @@ trainer:
   max_epochs: 100
   gradient_clip_val: 0.5 # 1.0
   gradient_clip_algorithm: "norm"
-  # precision: bf16-mixed
+  precision: bf16-mixed
 
