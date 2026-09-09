@@ -1,15 +1,15 @@
 import copy
 import gc
-from typing import Any, Dict, Tuple
+import random
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import wandb
 from lightning import LightningModule
 from lightning.pytorch.loggers import WandbLogger
-from torchmetrics import Metric, MeanMetric, MaxMetric
+from torchmetrics import MaxMetric, MeanMetric, Metric
 from torchmetrics.retrieval import RetrievalRecall
-import wandb
-import random
 
 
 class RetrievalRecallWrapper:
@@ -128,7 +128,8 @@ class Mamba3LitModule(LightningModule):
         self.proj1 = (
             torch.nn.Identity()
             if image_net.d_model == 512
-            else torch.nn.Linear(image_net.d_model, 512))
+            else torch.nn.Linear(image_net.d_model, 512)
+        )
         self.proj2 = torch.nn.Linear(text_net.d_model, 512)
 
         self.logit_scale = torch.nn.Parameter(
@@ -233,13 +234,15 @@ class Mamba3LitModule(LightningModule):
 
     def model_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor]
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
+    ) -> Optional[
+        Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
     ]:
         """Perform a single model step on a batch of data.
 
@@ -275,14 +278,11 @@ class Mamba3LitModule(LightningModule):
 
         # Defensive check
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"WARNING: NaN/Inf loss detected! loss={loss.item()}")
+            print(f"WARNING: NaN/Inf loss detected! loss={loss.item()}; skipping batch!")
             # Preserve device, dtype, and requires_grad from the original loss
-            loss = scale * 0.0  # Uses a parameter → keeps grad_fn
-            l_i2t = torch.tensor(0.0)
-            l_t2i = torch.tensor(0.0)
-            y = torch.tensor(0.0)
+            return None
 
-        return loss, logits_i2t, logits_t2i, y, img_emb, txt_emb
+        return loss, logits_i2t, logits_t2i, img_emb, txt_emb
 
     def training_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
@@ -310,11 +310,12 @@ class Mamba3LitModule(LightningModule):
         #     )
 
         # The model handles the embedding interpolation internally now!
-        loss, l_i2t, l_t2i, y, _, _ = self.model_step((images, texts, attention_mask))
+        result = self.model_step((images, texts, attention_mask))
 
         # Catch the NaN guard signal
-        if loss is None:
-            return None
+        if result is None:
+            return self.logit_scale * 0.0
+        loss, l_i2t, l_t2i, _, _ = result
 
         # Update separate I2T and T2I metrics
         self.train_i2t_r1.update(l_i2t)
@@ -365,13 +366,14 @@ class Mamba3LitModule(LightningModule):
 
         self.image_model.vit.image_size = self.base_size
 
-        loss, l_i2t, l_t2i, y, img_emb, txt_emb = self.model_step(
+        result = self.model_step(
             (images, texts, attention_mask)
         )
 
         # If validation batch is broken, exit early to protect global metric tracking
-        if loss is None:
+        if result is None:
             return
+        loss, l_i2t, l_t2i, img_emb, txt_emb = result
 
         self.val_batch_i2t_r1.update(l_i2t)
         self.val_batch_t2i_r1.update(l_t2i)
@@ -565,13 +567,14 @@ class Mamba3LitModule(LightningModule):
 
         self.image_model.vit.image_size = self.base_size
 
-        loss, l_i2t, l_t2i, y, img_emb, txt_emb = self.model_step(
+        result = self.model_step(
             (images, texts, attention_mask)
         )
 
         # If validation batch is broken, exit early to protect global metric tracking
-        if loss is None:
+        if result is None:
             return
+        loss, l_i2t, l_t2i, img_emb, txt_emb = result
 
         if img_emb.ndim == 1:
             img_emb = img_emb.unsqueeze(0)
@@ -766,10 +769,10 @@ class Mamba3LitModule(LightningModule):
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    "monitor": "val/mean_R1", 
+                    "monitor": "val/mean_R1",
                     "interval": "epoch",
                     "frequency": 1,
-                }
+                },
             }
         return {"optimizer": optimizer}
 
@@ -804,7 +807,6 @@ class Mamba3LitModule(LightningModule):
             # This will show up in WandB under the "val/predictions_sample" tab
             self.logger.experiment.log({f"{phase}/predictions_brief": table})
 
-        
     @torch.no_grad()
     def _save_misc_metrics(self, sim_matrix, all_texts, phase="val"):
         if not isinstance(self.logger, WandbLogger):
@@ -842,17 +844,13 @@ class Mamba3LitModule(LightningModule):
         true_cosine = query_sim[query_indices, query_indices]
 
         # Rank of the true caption: 1 means correct top-1
-        true_rank = (
-            (query_sim > true_cosine[:, None]).sum(dim=1) + 1
-        )
+        true_rank = (query_sim > true_cosine[:, None]).sum(dim=1) + 1
 
         # Temperature-scaled score, consistent with training logits
         scale = self.logit_scale.detach().exp().clamp(max=100)
         scaled_logits = scale * query_sim
         probabilities = torch.softmax(scaled_logits, dim=1)
-        top1_softmax_score = probabilities.gather(
-            1, top1_indices[:, None]
-        ).squeeze(1)
+        top1_softmax_score = probabilities.gather(1, top1_indices[:, None]).squeeze(1)
 
         columns = [
             "Image_Index",
@@ -884,9 +882,7 @@ class Mamba3LitModule(LightningModule):
                 predicted_idx == i,
             )
 
-        self.logger.experiment.log({
-            f"{phase}/predictions_detailed": table
-        })
+        self.logger.experiment.log({f"{phase}/predictions_detailed": table})
 
 
 if __name__ == "__main__":
