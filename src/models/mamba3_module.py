@@ -763,7 +763,7 @@ class Mamba3LitModule(LightningModule):
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    "monitor": "val/mean_R1",  # Use training metric since validation runs every 10 epochs
+                    "monitor": "val/mean_R1", 
                     "interval": "epoch",
                     "frequency": 1,
                 }
