@@ -3,7 +3,7 @@
 defaults:
   - override /hydra/sweeper: optuna
 
-optimized_metric: "val/mean_R1"
+optimized_metric: "val/mean_R1_best"
 
 hydra:
   mode: "MULTIRUN"

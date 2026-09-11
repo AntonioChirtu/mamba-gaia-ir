@@ -1,15 +1,11 @@
-import copy
 import gc
-import random
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple  # noqa: UP035
 
 import torch
-import torch.nn.functional as F
 import wandb
 from lightning import LightningModule
 from lightning.pytorch.loggers import WandbLogger
-from torchmetrics import MaxMetric, MeanMetric, Metric
-from torchmetrics.retrieval import RetrievalRecall
+from torchmetrics import MaxMetric, MeanMetric
 
 
 class RetrievalRecallWrapper:
@@ -234,21 +230,13 @@ class Mamba3LitModule(LightningModule):
 
     def model_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor]
-    ) -> Optional[
-        Tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-        ]
-    ]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Perform a single model step on a batch of data.
 
         :param batch: A batch of data (a tuple) containing the input tensor of images and target labels.
 
-        :return: A tuple containing (in order):
+        :return: None if it explodes, else:
+        A tuple containing (in order):
             - A tensor of losses.
             - A tensor of predictions.
             - A tensor of target labels.
@@ -279,7 +267,6 @@ class Mamba3LitModule(LightningModule):
         # Defensive check
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"WARNING: NaN/Inf loss detected! loss={loss.item()}; skipping batch!")
-            # Preserve device, dtype, and requires_grad from the original loss
             return None
 
         return loss, logits_i2t, logits_t2i, img_emb, txt_emb
