@@ -39,7 +39,7 @@ hydra:
     study_name: text_ablation_encoder
     n_jobs: 1
     direction: maximize
-    n_trials: 3  # = 3 text encoders; GridSampler enumerates every choice
+    n_trials: 2  # = 2 text encoders; GridSampler enumerates every choice
 
     # ONLY the swept dimension lives here: which text_net config group to use.
     params:
