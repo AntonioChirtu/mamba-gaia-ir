@@ -1,0 +1,6 @@
+# Classic recurrent baseline for the Mamba-3 text-encoder ablation
+# NOTE: n_layers not yet verified
+_target_: src.models.components.text_encoders.BiLSTMTextEncoder
+d_model: 768
+n_layers: 1
+dropout: 0.2

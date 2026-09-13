@@ -1,0 +1,46 @@
+# @package _global_
+# python src/train.py --multirun hparams_search=text_ablation experiment=gaia_full_exp
+
+defaults:
+  - override /hydra/sweeper: optuna
+  - override /hydra/sweeper/sampler: grid  # swap the WHOLE sampler config (TPE -> Grid)
+
+optimized_metric: "val/mean_R1"
+
+# --- Fixed values (GRID #4 winner + ablation constants) ---
+# Set as normal COMPOSE-TIME overrides so they win over gaia_full_exp / mamba3
+# (hparams_search is composed after `experiment` in train.yaml's defaults).
+seed: 12345
+
+model:
+  image_net:
+    d_model: 512
+  text_net:
+    dropout: 0.2
+  optimizer:
+    lr: 0.00015
+
+data:
+  max_length: 128
+
+trainer:
+  accumulate_grad_batches: 4
+
+hydra:
+  mode: "MULTIRUN"
+
+  job:
+    env_set:
+      WANDB_RUN_GROUP: "${oc.select:hydra.sweeper.study_name, 'text_ablation'}"
+
+  sweeper:
+    _target_: hydra_plugins.hydra_optuna_sweeper.optuna_sweeper.OptunaSweeper
+    storage: sqlite:///text_ablation.db
+    study_name: text_ablation_encoder
+    n_jobs: 1
+    direction: maximize
+    n_trials: 3  # = 3 text encoders; GridSampler enumerates every choice
+
+    # ONLY the swept dimension lives here: which text_net config group to use.
+    params:
+      model/text_net: choice(mamba3, transformer, bilstm)

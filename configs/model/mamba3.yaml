@@ -1,9 +1,13 @@
+defaults:
+  - text_net: mamba3
+  - _self_
+
 _target_: src.models.mamba3_module.Mamba3LitModule
 
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 0.0001              # 0.0001 # was 10x smaller
+  lr: 0.00015              # 0.0001 # was 10x smaller
   weight_decay: 0.05
 
 scheduler:
@@ -22,16 +26,6 @@ image_net:
   use_layer_norm: true
   dropout: 0.2 
 
-
-text_net:
-  _target_: src.models.components.mamba_ssm_local.modules.mamba3.Mamba3
-  d_model: 768
-  d_state: 256
-  d_conv: 4
-  expand: 2
-  headdim: 16
-  n_layers: 1
-  dropout: 0.2
 
 # compile model for faster training with pytorch 2.0
 compile: false

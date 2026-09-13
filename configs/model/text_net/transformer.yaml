@@ -1,0 +1,8 @@
+# Param-matched Transformer baseline for the Mamba-3 text-encoder ablation.
+# NOTE: n_layers/nhead/dim_feedforward are starting values, not yet verified
+# to match Mamba3's param count
+_target_: src.models.components.text_encoders.TransformerTextEncoder
+d_model: 768
+n_layers: 1
+nhead: 8
+dropout: 0.2
