@@ -88,10 +88,13 @@ class ResizeAndPad:
 class GAIADataset(Dataset):
     """Custom Dataset for GAIA Information Retrieval.
     
-    Each record is ``(image_path, captions)`` where ```captions`` is the list of
+    Each record is ``(image_path, captions)`` where ``captions`` is the list of
     synthetic captions GAIA provides per image. During training, a caption is
-    sampled at random each epoch (free text-side augmentation); during
-    validation/testing the first caption is used deterministically
+    sampled at random each epoch (free text-side augmentation). During
+    validation/testing all ``max_captions`` captions are returned so recall
+    can be computed against thefull multi-relevant target set (standard
+    protocol for 5-captions-per-image benchmarks: Flickr30k, COCO, RSICD/RSITMD)
+    instead of an arbitrary single caption.
     """
 
     def __init__(
@@ -100,7 +103,8 @@ class GAIADataset(Dataset):
         tokenizer: Any, 
         transform: Optional[Any] = None, 
         max_length: int = 128,
-        is_training: bool = True
+        is_training: bool = True,
+        max_captions: int = 5,
     ):
         self.records = records
         self.transform = transform
@@ -108,6 +112,7 @@ class GAIADataset(Dataset):
 
         self.max_length = max_length
         self.is_training = is_training
+        self.max_captions = max_captions
 
     def __len__(self):
         return len(self.records)
@@ -135,21 +140,55 @@ class GAIADataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        caption = self._pick_caption(captions)
+        if self.is_training:
+            caption = self._pick_caption(captions)
 
-        # Tokenize. attention_mask is returned so the model can pool the last
-        # non-pad toke (the tokenizer right-pads to max_length)
+            # Tokenize. attention_mask is returned so the model can pool the last
+            # non-pad toke (the tokenizer right-pads to max_length)
+            tokens = self.tokenizer(
+                caption,
+                padding='max_length',
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+
+            input_ids = tokens.input_ids.squeeze(0)
+            attention_mask = tokens.attention_mask.squeeze(0)
+            return image, input_ids, attention_mask, caption
+        
+        # Eval: return all captions so recall can be computed against the
+        # full multi-relevant target set (not just an arbitrary single one)
+        eval_captions = list(captions[: self.max_captions])
+        if not eval_captions:
+            eval_captions = [""]
+        if len(eval_captions) < self.max_captions:
+            eval_captions = eval_captions + [eval_captions[-1]] * (
+                self.max_captions - len(eval_captions)
+            )
+        
         tokens = self.tokenizer(
-            caption,
-            padding='max_length',
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
+                eval_captions,
+                padding='max_length',
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
         )
 
-        input_ids = tokens.input_ids.squeeze(0)
-        attention_mask = tokens.attention_mask.squeeze(0)
+        input_ids = tokens.input_ids
+        attention_mask = tokens.attention_mask
         return image, input_ids, attention_mask, caption
+
+def eval_collate_fn(batch):
+    """Collate for val/test: keeps per-image caption lists flat (image-major
+    order) instead of letting default_collate transpose them."""
+    images, input_ids, attention_mask, captions_lists, idxs = zip(*batch)
+    images = torch.stack(images)
+    input_ids = torch.stack(input_ids)
+    attention_mask = torch.stack(attention_mask)
+    flat_captions = [c for caps in captions_lists for c in caps]
+    idxs = torch.tensor(idxs, dtype=torch.long)
+    return images, input_ids, attention_mask, flat_captions, idxs
 
 
 class GAIADataModule(LightningDataModule):
@@ -168,6 +207,7 @@ class GAIADataModule(LightningDataModule):
             num_workers: int = 4,
             pin_memory: bool = False,
             max_length: int = 128,
+            max_captions: int = 5,
     ) -> None:
         super().__init__()
 
@@ -260,10 +300,12 @@ class GAIADataModule(LightningDataModule):
         self.data_val = GAIADataset(
             val_records, self.tokenizer, self.val_test_transforms,
             self.hparams.max_length, is_training=False,
+            max_captions=self.hparams.max_captions,
         )
         self.data_test = GAIADataset(
             test_records, self.tokenizer, self.val_test_transforms,
             self.hparams.max_length, is_training=False,
+            max_captions=self.hparams.max_captions,
         )
 
 
@@ -287,6 +329,7 @@ class GAIADataModule(LightningDataModule):
             shuffle=False,
             persistent_workers=self.hparams.num_workers > 0,
             drop_last=False,
+            collate_fn=eval_collate_fn,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -296,4 +339,5 @@ class GAIADataModule(LightningDataModule):
             num_workers=2,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
+            collate_fn=eval_collate_fn,
         )

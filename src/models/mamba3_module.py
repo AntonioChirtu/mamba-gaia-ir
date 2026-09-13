@@ -132,13 +132,15 @@ class Mamba3LitModule(LightningModule):
             torch.ones([]) * torch.log(torch.tensor(1 / logit_scale_init))
         )
 
-        self.val_outputs = {"img_embs": [], "txt_embs": [], "raw_texts": []}
+        self.val_outputs = {
+            "img_embs": [], "txt_embs": [], "raw_texts": [],
+            "img_ids": [], "txt_img_ids": [],
+        }
 
         # TODO: Make more complicated contrastive loss?
         # loss function
         self.criterion = torch.nn.CrossEntropyLoss()
 
-        # TODO: Add test recall, but for global set!
         # metric objects for calculating and averaging accuracy across batches
         self.train_recall = RetrievalRecallWrapper(k=1)
         # Separate metrics for I2T and T2I
@@ -162,12 +164,11 @@ class Mamba3LitModule(LightningModule):
         self.val_t2i_r1_best = MaxMetric()
         self.val_mean_r1_best = MaxMetric()
 
-        self.test_r1 = RetrievalRecallWrapper(k=1)
-        self.test_r5 = RetrievalRecallWrapper(k=5)
-        self.test_r10 = RetrievalRecallWrapper(k=10)
-
         # Initialize test outputs storage
-        self.test_outputs = {"img_embs": [], "txt_embs": [], "raw_texts": []}
+        self.test_outputs = {
+            "img_embs": [], "txt_embs": [], "raw_texts": [],
+            "img_ids": [], "txt_img_ids": [],
+        }
 
     def forward(
         self, x: torch.Tensor, modality="image", attention_mask=None
@@ -349,12 +350,20 @@ class Mamba3LitModule(LightningModule):
         :param batch_idx: The index of the current batch.
         """
         # 1. Use your model_step for the loss (keep it consistent!)
-        images, texts, attention_mask, text_strings = batch
+        # texts/attention_mask are [B, C, L] (C = captions per image, standard
+        # 5-caption protocol); anchor caption (index 0) drives loss/batch-r1
+        # exactly as before, all C captions are encoded for the epoch-end
+        # multi-relevant recall computation.
+        images, texts, attention_mask, text_strings, img_ids = batch
 
         self.image_model.vit.image_size = self.base_size
 
+        B, C, L = texts.shape
+        anchor_texts = texts[:, 0, :]
+        anchor_mask = attention_mask[:, 0, :]
+
         result = self.model_step(
-            (images, texts, attention_mask)
+            (images, anchor_texts, anchor_mask)
         )
 
         # If validation batch is broken, exit early to protect global metric tracking
@@ -367,11 +376,19 @@ class Mamba3LitModule(LightningModule):
 
         if img_emb.ndim == 1:
             img_emb = img_emb.unsqueeze(0)
-        if txt_emb.ndim == 1:
-            txt_emb = txt_emb.unsqueeze(0)
+        
+        # Encode all C captions per image for the full multi-relevant recall
+        texts_flat = texts.reshape(B * C, L)
+        mask_flat = attention_mask.reshape(B * C, L)
+        txt_emb_all = self.forward(texts_flat, modality="text", attention_mask=mask_flat)
+        txt_emb_all = torch.nn.functional.normalize(txt_emb_all, p=2, dim=-1)
+
+        txt_img_ids = img_ids.to(img_emb.device).repeat_interleave(C)
 
         self.val_outputs["img_embs"].append(img_emb.detach().cpu())
-        self.val_outputs["txt_embs"].append(txt_emb.detach().cpu())
+        self.val_outputs["txt_embs"].append(txt_emb_all.detach().cpu())
+        self.val_outputs["img_ids"].append(img_ids.detach().cpu())
+        self.val_outputs["txt_img_ids"].append(txt_img_ids.detach().cpu())
         self.val_outputs["raw_texts"].extend(text_strings)
 
         self.val_loss.update(loss)
@@ -403,18 +420,24 @@ class Mamba3LitModule(LightningModule):
         # Gather tensors
         local_img = torch.cat(self.val_outputs["img_embs"]).to(self.device)
         local_txt = torch.cat(self.val_outputs["txt_embs"]).to(self.device)
+        local_img_ids = torch.cat(self.val_outputs["img_ids"]).to(self.device)
+        local_txt_img_ids = torch.cat(self.val_outputs["txt_img_ids"]).to(self.device)
 
-        local_n = torch.tensor([local_img.shape[0]], device=self.device)
-        rank_sizes = self.all_gather(local_n).flatten()
+        local_n_img = torch.tensor([local_img.shape[0]], device=self.device)
+        local_n_txt = torch.tensor([local_txt.shape[0]], device=self.device)
+        rank_n_img = self.all_gather(local_n_img).flatten()
+        rank_n_txt = self.all_gather(local_n_txt).flatten()
 
-        if not torch.all(rank_sizes == rank_sizes[0]):
-            raise RuntimeError(f"Unequal samples across ranks: {rank_sizes.tolist()}")
+        if not torch.all(rank_n_img == rank_n_img[0]):
+            raise RuntimeError(f"Unequal image counts across ranks: {rank_n_img.tolist()}")
+        if not torch.all(rank_n_txt == rank_n_txt[0]):
+            raise RuntimeError(f"Unequal text counts across ranks: {rank_n_txt.tolist()}")
 
-        all_img = self.all_gather(local_img, sync_grads=False)
-        all_txt = self.all_gather(local_txt, sync_grads=False)
+        all_img = self.all_gather(local_img, sync_grads=False).reshape(-1, local_img.shape[-1])
+        all_txt = self.all_gather(local_txt, sync_grads=False).reshape(-1, local_txt.shape[-1])
 
-        all_img = all_img.reshape(-1, local_img.shape[-1])
-        all_txt = all_txt.reshape(-1, local_txt.shape[-1])
+        all_img_ids = self.all_gather(local_img_ids).reshape(-1)
+        all_txt_img_ids = self.all_gather(local_txt_img_ids).reshape(-1)
 
         if all_img.ndim != 2 or all_txt.ndim != 2:
             raise RuntimeError(
@@ -446,26 +469,27 @@ class Mamba3LitModule(LightningModule):
                 f"Expected 2-D similarity matrix, got {sim_matrix.shape}"
             )
 
-        num_images, num_texts = sim_matrix.shape
-
-        if num_images != num_texts:
-            raise RuntimeError(
-                f"Diagonal targets require a square matrix, got "
-                f"{num_images} images and {num_texts} texts"
-            )
-        targets = torch.arange(num_images, device=sim_matrix.device)
+        # Multi-relevant ground truth: text j is relevant to image i iff they
+        # share the same source-image id (standard 5-captions-per-image
+        # protocol), not just the diagonal
+        relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(0) # [N_img, N_txt]
 
         # 3. Calculate R@1, R@5, R@10 for both directions
         val_results = {}
         for k in [1, 5, 10, 20]:
-            # --- Image to Text (Rows) ---
-            _, top_k_i2t = sim_matrix.topk(k, dim=1)
-            r_i2t = (top_k_i2t == targets.view(-1, 1)).any(dim=1).float().mean()
+            kk = min(k, sim_matrix.shape[1])
+            # --- Image to Text (Rows): correct if ANY relevant caption is int top-k ---
+            top_k_i2t = sim_matrix.topk(kk, dim=1).indices
+            r_i2t = relevant.gather(1, top_k_i2t).any(dim=1).float().mean()
             val_results[f"val/I2T_R{k}"] = r_i2t
 
-            # --- Text to Image (Columns) ---
-            _, top_k_t2i = sim_matrix.t().topk(k, dim=1)
-            r_t2i = (top_k_t2i == targets.view(-1, 1)).any(dim=1).float().mean()
+            # --- Text to Image (Columns): correct if the true image is in top-k ---
+            sim_t = sim_matrix.t()
+            kk_t = min(k, sim_t.shape[1])
+            top_k_t2i = sim_t.topk(kk_t, dim=1).indices
+            candidate_ids = all_img_ids[top_k_t2i] # [N_txt, kk_t]
+            owning_ids = all_txt_img_ids.unsqueeze(1) # [N_txt, 1]
+            r_t2i = (candidate_ids == owning_ids).any(dim=1).float().mean()
             val_results[f"val/T2I_R{k}"] = r_t2i
 
         val_results["val/mean_R1"] = 0.5 * (
@@ -517,8 +541,8 @@ class Mamba3LitModule(LightningModule):
 
         # 6. Save visual results table
         if self.trainer.is_global_zero:
-            self._save_results(sim_matrix, all_strings, phase="val")
-            self._save_misc_metrics(sim_matrix, all_strings, phase="val")
+            self._save_results(sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="val")
+            self._save_misc_metrics(sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="val")
 
         # # Diagnostic to check DistributedSampler repeating samples
         # if self.trainer.is_global_zero:
@@ -532,7 +556,10 @@ class Mamba3LitModule(LightningModule):
         #         )
 
         # 7. Reset storage for the next epoch
-        self.val_outputs = {"img_embs": [], "txt_embs": [], "raw_texts": []}
+        self.val_outputs = {
+            "img_embs": [], "txt_embs": [], "raw_texts": [],
+            "img_ids": [], "txt_img_ids": [],
+        }
 
         self.val_batch_i2t_r1.reset()
         self.val_batch_t2i_r1.reset()
@@ -550,12 +577,16 @@ class Mamba3LitModule(LightningModule):
         :param batch_idx: The index of the current batch.
         """
 
-        images, texts, attention_mask, text_strings = batch
+        images, texts, attention_mask, text_strings, img_ids = batch
 
         self.image_model.vit.image_size = self.base_size
 
+        B, C, L = texts.shape
+        anchor_texts = texts[:, 0, :]
+        anchor_mask = attention_mask[:, 0, :]
+
         result = self.model_step(
-            (images, texts, attention_mask)
+            (images, anchor_texts, anchor_mask)
         )
 
         # If validation batch is broken, exit early to protect global metric tracking
@@ -565,11 +596,18 @@ class Mamba3LitModule(LightningModule):
 
         if img_emb.ndim == 1:
             img_emb = img_emb.unsqueeze(0)
-        if txt_emb.ndim == 1:
-            txt_emb = txt_emb.unsqueeze(0)
+        
+        texts_flat = texts.reshape(B * C, L)
+        mask_flat = attention_mask.reshape(B * C, L)
+        txt_emb_all = self.forward(texts_flat, modality="text", attention_mask=mask_flat)
+        txt_emb_all = torch.nn.functional.normalize(txt_emb_all, p=2, dim=-1)
+
+        txt_img_ids = img_ids.to(img_emb.device).repeat_interleave(C)
 
         self.test_outputs["img_embs"].append(img_emb.detach().cpu())
-        self.test_outputs["txt_embs"].append(txt_emb.detach().cpu())
+        self.test_outputs["txt_embs"].append(txt_emb_all.detach().cpu())
+        self.test_outputs["img_ids"].append(img_ids.detach().cpu())
+        self.test_outputs["txt_img_ids"].append(txt_img_ids.detach().cpu())
         self.test_outputs["raw_texts"].extend(text_strings)
 
     def on_test_epoch_end(self) -> None:
@@ -589,6 +627,8 @@ class Mamba3LitModule(LightningModule):
 
         local_img = torch.cat(self.test_outputs["img_embs"]).to(self.device)
         local_txt = torch.cat(self.test_outputs["txt_embs"]).to(self.device)
+        local_img_ids = torch.cat(self.test_outputs["img_ids"]).to(self.device)
+        local_txt_img_ids = torch.cat(self.test_outputs["txt_img_ids"]).to(self.device)
 
         if local_img.ndim != 2 or local_txt.ndim != 2:
             raise RuntimeError(
@@ -597,23 +637,22 @@ class Mamba3LitModule(LightningModule):
                 f"text={tuple(local_txt.shape)}"
             )
 
-        if local_img.shape[0] != local_txt.shape[0]:
-            raise RuntimeError(
-                f"Local image/text count mismatch: "
-                f"{local_img.shape[0]} vs {local_txt.shape[0]}"
-            )
 
-        local_n = torch.tensor([local_img.shape[0]], device=self.device)
-        rank_sizes = self.all_gather(local_n).flatten()
+        local_n_img = torch.tensor([local_img.shape[0]], device=self.device)
+        local_n_txt = torch.tensor([local_txt.shape[0]], device=self.device)
+        rank_n_img = self.all_gather(local_n_img).flatten()
+        rank_n_txt = self.all_gather(local_n_txt).flatten()
 
-        if not torch.all(rank_sizes == rank_sizes[0]):
-            raise RuntimeError(f"Unequal samples across ranks: {rank_sizes.tolist()}")
+        if not torch.all(rank_n_img == rank_n_img[0]):
+            raise RuntimeError(f"Unequal image counts across ranks: {rank_n_img.tolist()}")
+        if not torch.all(rank_n_txt == rank_n_txt[0]):
+            raise RuntimeError(f"Unequal text counts across ranks: {rank_n_txt.tolist()}")
 
-        all_img = self.all_gather(local_img, sync_grads=False)
-        all_txt = self.all_gather(local_txt, sync_grads=False)
+        all_img = self.all_gather(local_img, sync_grads=False).reshape(-1, local_img.shape[-1])
+        all_txt = self.all_gather(local_txt, sync_grads=False).reshape(-1, local_txt.shape[-1])
 
-        all_img = all_img.reshape(-1, local_img.shape[-1])
-        all_txt = all_txt.reshape(-1, local_txt.shape[-1])
+        all_img_ids = self.all_gather(local_img_ids).reshape(-1)
+        all_txt_img_ids = self.all_gather(local_txt_img_ids).reshape(-1)
 
         if all_img.ndim != 2 or all_txt.ndim != 2:
             raise RuntimeError(
@@ -645,32 +684,33 @@ class Mamba3LitModule(LightningModule):
                 f"Expected 2-D similarity matrix, got {sim_matrix.shape}"
             )
 
-        num_images, num_texts = sim_matrix.shape
-
-        if len(all_strings) != num_images:
+        if len(all_strings) != sim_matrix.shape[1]:
             raise RuntimeError(
                 f"Embedding/string count mismatch: "
-                f"{num_images} embeddings vs {len(all_strings)} strings"
+                f"{sim_matrix.shape[1]} text embeddings vs {len(all_strings)} strings"
             )
 
-        if num_images != num_texts:
-            raise RuntimeError(
-                f"Diagonal targets require a square matrix, got "
-                f"{num_images} images and {num_texts} texts"
-            )
-        targets = torch.arange(num_images, device=sim_matrix.device)
+        # Multi-relevant ground truth: text j is relevant to image i iff they
+        # share the same source-img id (standard 5-captions-per-image
+        # protocol), not just the diagonal
+        relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(0) # [N_img, N_txt]
 
         # 3. Calculate R@1, R@5, R@10 for both directions
         test_results = {}
         for k in [1, 5, 10, 20]:
-            # --- Image to Text (Rows) ---
-            _, top_k_i2t = sim_matrix.topk(k, dim=1)
-            r_i2t = (top_k_i2t == targets.view(-1, 1)).any(dim=1).float().mean()
+            kk = min(k, sim_matrix.shape[1])
+            # --- Image to Text (Rows): correct if ANY relevant caption is int top-k ---
+            top_k_i2t = sim_matrix.topk(kk, dim=1).indices
+            r_i2t = relevant.gather(1, top_k_i2t).any(dim=1).float().mean()
             test_results[f"test/I2T_R{k}"] = r_i2t
 
-            # --- Text to Image (Columns) ---
-            _, top_k_t2i = sim_matrix.t().topk(k, dim=1)
-            r_t2i = (top_k_t2i == targets.view(-1, 1)).any(dim=1).float().mean()
+            # --- Text to Image (Columns): correct if the true image is in top-k ---
+            sim_t = sim_matrix.t()
+            kk_t = min(k, sim_t.shape[1])
+            top_k_t2i = sim_t.topk(kk_t, dim=1).indices
+            candidate_ids = all_img_ids[top_k_t2i] # [N_txt, kk_t]
+            owning_ids = all_txt_img_ids.unsqueeze(1) # [N_txt, 1]
+            r_t2i = (candidate_ids == owning_ids).any(dim=1).float().mean()
             test_results[f"test/T2I_R{k}"] = r_t2i
 
         test_results["test/mean_R1"] = 0.5 * (
@@ -688,11 +728,14 @@ class Mamba3LitModule(LightningModule):
 
         # 6. Save visual results table
         if self.trainer.is_global_zero:
-            self._save_results(sim_matrix, all_strings, phase="test")
-            self._save_misc_metrics(sim_matrix, all_strings, phase="test")
+            self._save_results(sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="test")
+            self._save_misc_metrics(sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="test")
 
         # 7. Reset storage for the next epoch
-        self.test_outputs = {"img_embs": [], "txt_embs": [], "raw_texts": []}
+        self.test_outputs = {
+            "img_embs": [], "txt_embs": [], "raw_texts": [],
+            "img_ids": [], "txt_img_ids": [],
+        }
 
     def setup(self, stage: str) -> None:
         """Lightning hook that is called at the beginning of fit (train + validate), validate,
@@ -763,7 +806,7 @@ class Mamba3LitModule(LightningModule):
             }
         return {"optimizer": optimizer}
 
-    def _save_results(self, sim_matrix, all_texts, phase="val"):
+    def _save_results(self, sim_matrix, all_texts, img_ids, txt_img_ids, phase="val"):
         """Logs a table to WandB showing what the model predicted."""
         if isinstance(self.logger, WandbLogger):
             columns = [
@@ -778,16 +821,20 @@ class Mamba3LitModule(LightningModule):
             # Look at the first 15 images to keep the WandB payload light
             num_samples_to_log = min(15, sim_matrix.shape[0])
 
+            relevant = img_ids.unsqueeze(1) == txt_img_ids.unsqueeze(0) # [N_img, N_txt]
+
             # Convert raw similarities to probabilities for readability
             probs = torch.softmax(sim_matrix[:num_samples_to_log].float(), dim=1)
             confidences, indices = probs.topk(1, dim=1)
 
             for i in range(num_samples_to_log):
-                true_caption = all_texts[i]
+                # Show one of the (possibly several) ground-truth captions for this image
+                gt_indices = relevant[i].nonzero(as_tuple=True)[0]
+                true_caption = all_texts[gt_indices[0].item()] if len(gt_indices) else ""
                 predicted_idx = indices[i].item()
                 predicted_caption = all_texts[predicted_idx]
                 conf = confidences[i].item()
-                is_correct = predicted_idx == i
+                is_correct = bool(relevant[i, predicted_idx].item())
 
                 table.add_data(i, true_caption, predicted_caption, conf, is_correct)
 
@@ -795,7 +842,7 @@ class Mamba3LitModule(LightningModule):
             self.logger.experiment.log({f"{phase}/predictions_brief": table})
 
     @torch.no_grad()
-    def _save_misc_metrics(self, sim_matrix, all_texts, phase="val"):
+    def _save_misc_metrics(self, sim_matrix, all_texts, img_ids, txt_img_ids, phase="val"):
         if not isinstance(self.logger, WandbLogger):
             return
 
@@ -808,6 +855,7 @@ class Mamba3LitModule(LightningModule):
             )
 
         query_sim = sim_matrix[:num_samples].float()
+        relevant = img_ids[:num_samples].unsqueeze(1) == txt_img_ids.unsqueeze(0) # [num_samples, N_txt]
 
         # Top-1 and top-2 cosine similarities
         k = min(2, num_candidates)
@@ -823,14 +871,11 @@ class Mamba3LitModule(LightningModule):
             top2_cosine = torch.full_like(top1_cosine, float("nan"))
             cosine_margin = torch.full_like(top1_cosine, float("nan"))
 
-        # Diagonal is the correct caption under one-to-one pairing
-        query_indices = torch.arange(
-            num_samples,
-            device=sim_matrix.device,
-        )
-        true_cosine = query_sim[query_indices, query_indices]
+        # "True" cosine = best similarity among this image's relevant (ground truth) captions
+        masked_sim = query_sim.masked_fill(~relevant, float("-inf"))
+        true_cosine, true_gt_idx = masked_sim.max(dim=1)
 
-        # Rank of the true caption: 1 means correct top-1
+        # Rank of the best-matching true caption: 1 means correct top-1
         true_rank = (query_sim > true_cosine[:, None]).sum(dim=1) + 1
 
         # Temperature-scaled score, consistent with training logits
@@ -855,10 +900,11 @@ class Mamba3LitModule(LightningModule):
 
         for i in range(num_samples):
             predicted_idx = top1_indices[i].item()
+            true_idx = true_gt_idx[i].item()
 
             table.add_data(
                 i,
-                all_texts[i],
+                all_texts[true_idx],
                 all_texts[predicted_idx],
                 true_rank[i].item(),
                 top1_cosine[i].item(),
@@ -866,7 +912,7 @@ class Mamba3LitModule(LightningModule):
                 top2_cosine[i].item(),
                 cosine_margin[i].item(),
                 top1_softmax_score[i].item(),
-                predicted_idx == i,
+                bool(relevant[i, predicted_idx].item()),
             )
 
         self.logger.experiment.log({f"{phase}/predictions_detailed": table})
