@@ -136,7 +136,6 @@ class Mamba2LitModule(LightningModule):
         # loss function
         self.criterion = torch.nn.CrossEntropyLoss()
 
-        # TODO: Add test recall, but for global set!
         # metric objects for calculating and averaging accuracy across batches
         self.train_recall = RetrievalRecallWrapper(k=1)
         # Separate metrics for I2T and T2I
@@ -155,10 +154,6 @@ class Mamba2LitModule(LightningModule):
         # for tracking best so far validation accuracy
         self.val_i2t_r1_best = MaxMetric()
         self.val_t2i_r1_best = MaxMetric()
-
-        self.test_r1 = RetrievalRecallWrapper(k=1)
-        self.test_r5 = RetrievalRecallWrapper(k=5)
-        self.test_r10 = RetrievalRecallWrapper(k=10)
         
         # Initialize test outputs storage
         self.test_outputs = {}

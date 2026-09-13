@@ -43,4 +43,4 @@ hydra:
 
     # ONLY the swept dimension lives here: which text_net config group to use.
     params:
-      model/text_net: choice(mamba3, transformer, bilstm)
+      model/text_net: choice(transformer, bilstm)
