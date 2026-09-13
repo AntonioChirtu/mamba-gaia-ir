@@ -17,7 +17,7 @@ image_net:
   _target_: src.models.components.vit_custom_multiscale_augmentation.ViTOnlySimpleOptimized
   backbone: vit_b32
   pretrained: true
-  d_model: 256 # TODO: 512
+  d_model: 512 # TODO: 512
   freeze_backbone: false  # Fine-tune for faster adaptation, unfreezes just last 4 layers
   use_layer_norm: true
   dropout: 0.2 

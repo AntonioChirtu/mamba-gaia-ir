@@ -22,8 +22,8 @@ hydra:
     n_trials: 6
     
     params:      
-      model.text_net.d_state: choice(32, 64)           
-      model.optimizer.lr: choice(0.00015, 0.00018, 0.00022)
+      model.text_net.d_state: choice(32)           
+      model.optimizer.lr: choice(0.00015)
 
       model.image_net.d_model: choice(512)
       data.max_length: 128
