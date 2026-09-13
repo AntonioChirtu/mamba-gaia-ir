@@ -177,7 +177,7 @@ class GAIADataset(Dataset):
 
         input_ids = tokens.input_ids
         attention_mask = tokens.attention_mask
-        return image, input_ids, attention_mask, caption
+        return image, input_ids, attention_mask, eval_captions, idx
 
 def eval_collate_fn(batch):
     """Collate for val/test: keeps per-image caption lists flat (image-major
