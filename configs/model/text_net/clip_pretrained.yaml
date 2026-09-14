@@ -1,0 +1,7 @@
+# CLIP's pretrained transformer text tower - bypasses the shared from-scratch
+# text_embed entirely
+# Freeze policy matches the image encoder's: last 4 blocks unfrozen, rest frozen
+_target_: src.models.components.clip_text_tower.CLIPPretrainedTextEncoder
+model_name: ViT-B-32
+pretrained: openai
+unfreeze_last_n_blocks: 4

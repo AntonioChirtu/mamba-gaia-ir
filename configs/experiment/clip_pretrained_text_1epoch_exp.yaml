@@ -1,0 +1,8 @@
+# Run: python src/train.py experiment=clip_pretrained_text_1epoch_exp
+
+defaults:
+  - clip_pretrained_text_exp
+
+trainer:
+  min_epochs: 1
+  max_epochs: 1

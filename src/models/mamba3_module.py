@@ -133,8 +133,11 @@ class Mamba3LitModule(LightningModule):
         )
 
         self.val_outputs = {
-            "img_embs": [], "txt_embs": [], "raw_texts": [],
-            "img_ids": [], "txt_img_ids": [],
+            "img_embs": [],
+            "txt_embs": [],
+            "raw_texts": [],
+            "img_ids": [],
+            "txt_img_ids": [],
         }
 
         # TODO: Make more complicated contrastive loss?
@@ -166,16 +169,22 @@ class Mamba3LitModule(LightningModule):
 
         # Initialize test outputs storage
         self.test_outputs = {
-            "img_embs": [], "txt_embs": [], "raw_texts": [],
-            "img_ids": [], "txt_img_ids": [],
+            "img_embs": [],
+            "txt_embs": [],
+            "raw_texts": [],
+            "img_ids": [],
+            "txt_img_ids": [],
         }
 
     def forward(
-        self, x: torch.Tensor, modality="image", attention_mask=None
+        self, x: torch.Tensor, modality="image", attention_mask=None, raw_texts=None
     ) -> torch.Tensor:
         """Perform a forward pass through the model `self.net`.
 
-        :param x: A tensor of images.
+        :param x: A tensor of images, or token ids for text (ignored when the
+            active text_net encodes raw text directly, e.g. CLIPPretrainedTextEncoder).
+        :param raw_texts: Raw caption strings, required when
+            `self.text_model.encodes_raw_text` is set.
         :return: A tensor of logits.
         """
         if modality == "image":
@@ -195,20 +204,25 @@ class Mamba3LitModule(LightningModule):
                 out = out[:, -1, :]
             out = self.proj1(out)
         else:
-            # x is [B, seq_len] token_ids -> [B, seq_len, d_model]
-            x = self.text_embed(x)
-            out = self.text_model(x)  # [B, L, d_model]
+            if getattr(self.text_model, "encodes_raw_text", False):
+                # Self-contained pretrained text tower: owns its own tokenizer
+                # and embedding, bypasses self.text_embed entirely.
+                out = self.text_model(raw_texts)
+            else:
+                # x is [B, seq_len] token_ids -> [B, seq_len, d_model]
+                x = self.text_embed(x)
+                out = self.text_model(x)  # [B, L, d_model]
 
-            if out.dim() == 3:
-                if attention_mask is not None:
-                    # Pool the last NON-PAD token (tokenizer right-pads), instead of
-                    # the last position which would be a PAD token.
-                    lengths = attention_mask.long().sum(dim=1) - 1  # [B]
-                    lengths = lengths.clamp(min=0)
-                    idx = lengths.view(-1, 1, 1).expand(-1, 1, out.size(-1))
-                    out = out.gather(1, idx).squeeze(1)  # [B, d_model]
-                else:
-                    out = out[:, -1, :]
+                if out.dim() == 3:
+                    if attention_mask is not None:
+                        # Pool the last NON-PAD token (tokenizer right-pads), instead of
+                        # the last position which would be a PAD token.
+                        lengths = attention_mask.long().sum(dim=1) - 1  # [B]
+                        lengths = lengths.clamp(min=0)
+                        idx = lengths.view(-1, 1, 1).expand(-1, 1, out.size(-1))
+                        out = out.gather(1, idx).squeeze(1)  # [B, d_model]
+                    else:
+                        out = out[:, -1, :]
             out = self.proj2(out)
 
         return out
@@ -230,11 +244,16 @@ class Mamba3LitModule(LightningModule):
         self.val_batch_t2i_r1.reset()
 
     def model_step(
-        self, batch: Tuple[torch.Tensor, torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        self, batch: Tuple[torch.Tensor, torch.Tensor], raw_texts=None
+    ) -> (
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None
+    ):
         """Perform a single model step on a batch of data.
 
         :param batch: A batch of data (a tuple) containing the input tensor of images and target labels.
+        :param raw_texts: Raw caption strings, forwarded to the text encoder when the
+            active text_next encodes raw text directly
 
         :return: None if it explodes, else:
         A tuple containing (in order):
@@ -246,7 +265,9 @@ class Mamba3LitModule(LightningModule):
         images, texts, attention_mask = batch
 
         img_emb = self.forward(images, modality="image")
-        txt_emb = self.forward(texts, modality="text", attention_mask=attention_mask)
+        txt_emb = self.forward(
+            texts, modality="text", attention_mask=attention_mask, raw_texts=raw_texts
+        )
 
         img_emb = torch.nn.functional.normalize(img_emb, p=2, dim=-1)
         txt_emb = torch.nn.functional.normalize(txt_emb, p=2, dim=-1)
@@ -267,7 +288,9 @@ class Mamba3LitModule(LightningModule):
 
         # Defensive check
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"WARNING: NaN/Inf loss detected! loss={loss.item()}; skipping batch!")
+            print(
+                f"WARNING: NaN/Inf loss detected! loss={loss.item()}; skipping batch!"
+            )
             return None
 
         return loss, logits_i2t, logits_t2i, img_emb, txt_emb
@@ -282,7 +305,7 @@ class Mamba3LitModule(LightningModule):
         :param batch_idx: The index of the current batch.
         :return: A tensor of losses between model predictions and targets.
         """
-        images, texts, attention_mask, _ = batch
+        images, texts, attention_mask, captions = batch
 
         # # Multiscale Augmentation Trigger
         # if batch_idx % 10 == 0:
@@ -298,7 +321,7 @@ class Mamba3LitModule(LightningModule):
         #     )
 
         # The model handles the embedding interpolation internally now!
-        result = self.model_step((images, texts, attention_mask))
+        result = self.model_step((images, texts, attention_mask), raw_texts=captions)
 
         # Catch the NaN guard signal
         if result is None:
@@ -361,10 +384,9 @@ class Mamba3LitModule(LightningModule):
         B, C, L = texts.shape
         anchor_texts = texts[:, 0, :]
         anchor_mask = attention_mask[:, 0, :]
+        anchor_texts_str = text_strings[0::C] # index 0 of each image's C captions
 
-        result = self.model_step(
-            (images, anchor_texts, anchor_mask)
-        )
+        result = self.model_step((images, anchor_texts, anchor_mask), raw_texts=anchor_texts_str)
 
         # If validation batch is broken, exit early to protect global metric tracking
         if result is None:
@@ -376,11 +398,13 @@ class Mamba3LitModule(LightningModule):
 
         if img_emb.ndim == 1:
             img_emb = img_emb.unsqueeze(0)
-        
+
         # Encode all C captions per image for the full multi-relevant recall
         texts_flat = texts.reshape(B * C, L)
         mask_flat = attention_mask.reshape(B * C, L)
-        txt_emb_all = self.forward(texts_flat, modality="text", attention_mask=mask_flat)
+        txt_emb_all = self.forward(
+            texts_flat, modality="text", attention_mask=mask_flat, raw_texts=text_strings
+        )
         txt_emb_all = torch.nn.functional.normalize(txt_emb_all, p=2, dim=-1)
 
         txt_img_ids = img_ids.to(img_emb.device).repeat_interleave(C)
@@ -429,12 +453,20 @@ class Mamba3LitModule(LightningModule):
         rank_n_txt = self.all_gather(local_n_txt).flatten()
 
         if not torch.all(rank_n_img == rank_n_img[0]):
-            raise RuntimeError(f"Unequal image counts across ranks: {rank_n_img.tolist()}")
+            raise RuntimeError(
+                f"Unequal image counts across ranks: {rank_n_img.tolist()}"
+            )
         if not torch.all(rank_n_txt == rank_n_txt[0]):
-            raise RuntimeError(f"Unequal text counts across ranks: {rank_n_txt.tolist()}")
+            raise RuntimeError(
+                f"Unequal text counts across ranks: {rank_n_txt.tolist()}"
+            )
 
-        all_img = self.all_gather(local_img, sync_grads=False).reshape(-1, local_img.shape[-1])
-        all_txt = self.all_gather(local_txt, sync_grads=False).reshape(-1, local_txt.shape[-1])
+        all_img = self.all_gather(local_img, sync_grads=False).reshape(
+            -1, local_img.shape[-1]
+        )
+        all_txt = self.all_gather(local_txt, sync_grads=False).reshape(
+            -1, local_txt.shape[-1]
+        )
 
         all_img_ids = self.all_gather(local_img_ids).reshape(-1)
         all_txt_img_ids = self.all_gather(local_txt_img_ids).reshape(-1)
@@ -472,7 +504,9 @@ class Mamba3LitModule(LightningModule):
         # Multi-relevant ground truth: text j is relevant to image i iff they
         # share the same source-image id (standard 5-captions-per-image
         # protocol), not just the diagonal
-        relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(0) # [N_img, N_txt]
+        relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(
+            0
+        )  # [N_img, N_txt]
 
         # 3. Calculate R@1, R@5, R@10 for both directions
         val_results = {}
@@ -487,8 +521,8 @@ class Mamba3LitModule(LightningModule):
             sim_t = sim_matrix.t()
             kk_t = min(k, sim_t.shape[1])
             top_k_t2i = sim_t.topk(kk_t, dim=1).indices
-            candidate_ids = all_img_ids[top_k_t2i] # [N_txt, kk_t]
-            owning_ids = all_txt_img_ids.unsqueeze(1) # [N_txt, 1]
+            candidate_ids = all_img_ids[top_k_t2i]  # [N_txt, kk_t]
+            owning_ids = all_txt_img_ids.unsqueeze(1)  # [N_txt, 1]
             r_t2i = (candidate_ids == owning_ids).any(dim=1).float().mean()
             val_results[f"val/T2I_R{k}"] = r_t2i
 
@@ -541,8 +575,12 @@ class Mamba3LitModule(LightningModule):
 
         # 6. Save visual results table
         if self.trainer.is_global_zero:
-            self._save_results(sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="val")
-            self._save_misc_metrics(sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="val")
+            self._save_results(
+                sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="val"
+            )
+            self._save_misc_metrics(
+                sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="val"
+            )
 
         # # Diagnostic to check DistributedSampler repeating samples
         # if self.trainer.is_global_zero:
@@ -557,8 +595,11 @@ class Mamba3LitModule(LightningModule):
 
         # 7. Reset storage for the next epoch
         self.val_outputs = {
-            "img_embs": [], "txt_embs": [], "raw_texts": [],
-            "img_ids": [], "txt_img_ids": [],
+            "img_embs": [],
+            "txt_embs": [],
+            "raw_texts": [],
+            "img_ids": [],
+            "txt_img_ids": [],
         }
 
         self.val_batch_i2t_r1.reset()
@@ -584,10 +625,9 @@ class Mamba3LitModule(LightningModule):
         B, C, L = texts.shape
         anchor_texts = texts[:, 0, :]
         anchor_mask = attention_mask[:, 0, :]
+        anchor_texts_str = text_strings[0::C] # index 0 of each image's C captions
 
-        result = self.model_step(
-            (images, anchor_texts, anchor_mask)
-        )
+        result = self.model_step((images, anchor_texts, anchor_mask), raw_texts=anchor_texts_str)
 
         # If validation batch is broken, exit early to protect global metric tracking
         if result is None:
@@ -596,10 +636,12 @@ class Mamba3LitModule(LightningModule):
 
         if img_emb.ndim == 1:
             img_emb = img_emb.unsqueeze(0)
-        
+
         texts_flat = texts.reshape(B * C, L)
         mask_flat = attention_mask.reshape(B * C, L)
-        txt_emb_all = self.forward(texts_flat, modality="text", attention_mask=mask_flat)
+        txt_emb_all = self.forward(
+            texts_flat, modality="text", attention_mask=mask_flat, raw_texts=text_strings
+        )
         txt_emb_all = torch.nn.functional.normalize(txt_emb_all, p=2, dim=-1)
 
         txt_img_ids = img_ids.to(img_emb.device).repeat_interleave(C)
@@ -637,19 +679,26 @@ class Mamba3LitModule(LightningModule):
                 f"text={tuple(local_txt.shape)}"
             )
 
-
         local_n_img = torch.tensor([local_img.shape[0]], device=self.device)
         local_n_txt = torch.tensor([local_txt.shape[0]], device=self.device)
         rank_n_img = self.all_gather(local_n_img).flatten()
         rank_n_txt = self.all_gather(local_n_txt).flatten()
 
         if not torch.all(rank_n_img == rank_n_img[0]):
-            raise RuntimeError(f"Unequal image counts across ranks: {rank_n_img.tolist()}")
+            raise RuntimeError(
+                f"Unequal image counts across ranks: {rank_n_img.tolist()}"
+            )
         if not torch.all(rank_n_txt == rank_n_txt[0]):
-            raise RuntimeError(f"Unequal text counts across ranks: {rank_n_txt.tolist()}")
+            raise RuntimeError(
+                f"Unequal text counts across ranks: {rank_n_txt.tolist()}"
+            )
 
-        all_img = self.all_gather(local_img, sync_grads=False).reshape(-1, local_img.shape[-1])
-        all_txt = self.all_gather(local_txt, sync_grads=False).reshape(-1, local_txt.shape[-1])
+        all_img = self.all_gather(local_img, sync_grads=False).reshape(
+            -1, local_img.shape[-1]
+        )
+        all_txt = self.all_gather(local_txt, sync_grads=False).reshape(
+            -1, local_txt.shape[-1]
+        )
 
         all_img_ids = self.all_gather(local_img_ids).reshape(-1)
         all_txt_img_ids = self.all_gather(local_txt_img_ids).reshape(-1)
@@ -693,7 +742,9 @@ class Mamba3LitModule(LightningModule):
         # Multi-relevant ground truth: text j is relevant to image i iff they
         # share the same source-img id (standard 5-captions-per-image
         # protocol), not just the diagonal
-        relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(0) # [N_img, N_txt]
+        relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(
+            0
+        )  # [N_img, N_txt]
 
         # 3. Calculate R@1, R@5, R@10 for both directions
         test_results = {}
@@ -708,8 +759,8 @@ class Mamba3LitModule(LightningModule):
             sim_t = sim_matrix.t()
             kk_t = min(k, sim_t.shape[1])
             top_k_t2i = sim_t.topk(kk_t, dim=1).indices
-            candidate_ids = all_img_ids[top_k_t2i] # [N_txt, kk_t]
-            owning_ids = all_txt_img_ids.unsqueeze(1) # [N_txt, 1]
+            candidate_ids = all_img_ids[top_k_t2i]  # [N_txt, kk_t]
+            owning_ids = all_txt_img_ids.unsqueeze(1)  # [N_txt, 1]
             r_t2i = (candidate_ids == owning_ids).any(dim=1).float().mean()
             test_results[f"test/T2I_R{k}"] = r_t2i
 
@@ -728,13 +779,20 @@ class Mamba3LitModule(LightningModule):
 
         # 6. Save visual results table
         if self.trainer.is_global_zero:
-            self._save_results(sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="test")
-            self._save_misc_metrics(sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="test")
+            self._save_results(
+                sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="test"
+            )
+            self._save_misc_metrics(
+                sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="test"
+            )
 
         # 7. Reset storage for the next epoch
         self.test_outputs = {
-            "img_embs": [], "txt_embs": [], "raw_texts": [],
-            "img_ids": [], "txt_img_ids": [],
+            "img_embs": [],
+            "txt_embs": [],
+            "raw_texts": [],
+            "img_ids": [],
+            "txt_img_ids": [],
         }
 
     def setup(self, stage: str) -> None:
@@ -821,7 +879,9 @@ class Mamba3LitModule(LightningModule):
             # Look at the first 15 images to keep the WandB payload light
             num_samples_to_log = min(15, sim_matrix.shape[0])
 
-            relevant = img_ids.unsqueeze(1) == txt_img_ids.unsqueeze(0) # [N_img, N_txt]
+            relevant = img_ids.unsqueeze(1) == txt_img_ids.unsqueeze(
+                0
+            )  # [N_img, N_txt]
 
             # Convert raw similarities to probabilities for readability
             probs = torch.softmax(sim_matrix[:num_samples_to_log].float(), dim=1)
@@ -830,7 +890,9 @@ class Mamba3LitModule(LightningModule):
             for i in range(num_samples_to_log):
                 # Show one of the (possibly several) ground-truth captions for this image
                 gt_indices = relevant[i].nonzero(as_tuple=True)[0]
-                true_caption = all_texts[gt_indices[0].item()] if len(gt_indices) else ""
+                true_caption = (
+                    all_texts[gt_indices[0].item()] if len(gt_indices) else ""
+                )
                 predicted_idx = indices[i].item()
                 predicted_caption = all_texts[predicted_idx]
                 conf = confidences[i].item()
@@ -842,7 +904,9 @@ class Mamba3LitModule(LightningModule):
             self.logger.experiment.log({f"{phase}/predictions_brief": table})
 
     @torch.no_grad()
-    def _save_misc_metrics(self, sim_matrix, all_texts, img_ids, txt_img_ids, phase="val"):
+    def _save_misc_metrics(
+        self, sim_matrix, all_texts, img_ids, txt_img_ids, phase="val"
+    ):
         if not isinstance(self.logger, WandbLogger):
             return
 
@@ -855,7 +919,9 @@ class Mamba3LitModule(LightningModule):
             )
 
         query_sim = sim_matrix[:num_samples].float()
-        relevant = img_ids[:num_samples].unsqueeze(1) == txt_img_ids.unsqueeze(0) # [num_samples, N_txt]
+        relevant = img_ids[:num_samples].unsqueeze(1) == txt_img_ids.unsqueeze(
+            0
+        )  # [num_samples, N_txt]
 
         # Top-1 and top-2 cosine similarities
         k = min(2, num_candidates)
