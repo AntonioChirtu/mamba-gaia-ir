@@ -1,9 +1,10 @@
 # @package _global_
+# Run: python src/eval.py ckpt_path=path/to/checkpoint.ckpt
 
 defaults:
   - _self_
-  - data: mnist # choose datamodule with `test_dataloader()` for evaluation
-  - model: mnist
+  - data: gaia # choose datamodule with `test_dataloader()` for evaluation
+  - model: mamba3
   - logger: null
   - trainer: default
   - paths: default
@@ -15,4 +16,4 @@ task_name: "eval"
 tags: ["dev"]
 
 # passing checkpoint path is necessary for evaluation
-ckpt_path: "/home/antonio/projects/mamba-gaia-ir/logs/train/runs/2026-04-28_17-16-04/checkpoints/epoch_079.ckpt"
+ckpt_path: null

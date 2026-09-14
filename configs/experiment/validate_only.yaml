@@ -1,17 +1,19 @@
 # @package _global_
 
 # Validation only experiment - skips training, runs validation only
+# Run: python src/train.py experiment=validate_only ckpt_path=path/to/checkpoint.ckpt
 
 defaults:
   - override /data: gaia
-  - override /model: mamba2
+  - override /model: mamba3
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["GAIA", "mamba2", "validate_only"]
+tags: ["GAIA", "mamba3", "validate_only"]
 
 seed: 42
 
+train: false
 validate_only: true  # Enable validation-only mode
 
 trainer:
@@ -43,7 +45,7 @@ logger:
 callbacks:
   early_stopping:
     _target_: lightning.pytorch.callbacks.EarlyStopping
-    monitor: "val/I2T_R1"
+    monitor: "val/mean_R1"
     patience: 3
     mode: "max"
     min_delta: 0.001
