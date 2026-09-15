@@ -1,3 +1,5 @@
+# @package _global_
+
 # Run: python src/train.py experiment=clip_pretrained_text_exp
 
 defaults:
@@ -9,9 +11,12 @@ defaults:
 
 tags: ["gaia", "clip_pretrained_text"]
 
+seed: 12345
+
 trainer:
   min_epochs: 10
   max_epochs: 100
   gradient_clip_val: 0.5
   gradient_clip_algorithm: "norm"
   precision: bf16-mixed
+  accumulate_grad_batches: 4

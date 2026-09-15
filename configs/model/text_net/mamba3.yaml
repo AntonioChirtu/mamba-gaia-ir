@@ -1,6 +1,6 @@
 _target_: src.models.components.mamba_ssm_local.modules.mamba3.Mamba3
 d_model: 768
-d_state: 32
+d_state: 64
 d_conv: 4
 expand: 2
 headdim: 16

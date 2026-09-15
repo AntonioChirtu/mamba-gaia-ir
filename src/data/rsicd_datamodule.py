@@ -40,7 +40,11 @@ class RSICDDataset(Dataset):
 
         if split == "train":
             csv_files_to_load.append(os.path.join(root_dir, "train.csv"))
-        elif split in ["val", "test", "combined_val"]:
+        elif split == "val":
+            csv_files_to_load.append(os.path.join(root_dir, "val.csv"))
+        elif split == "test":
+            csv_files_to_load.append(os.path.join(root_dir, "test.csv"))
+        elif split == "combined_val":
             # If we want the combined validation set, we load BOTH csv targets
             # csv_files_to_load.append(os.path.join(root_dir, "train.csv"))
             csv_files_to_load.append(os.path.join(root_dir, "val.csv"))
@@ -57,7 +61,6 @@ class RSICDDataset(Dataset):
         # Concatenate columns seamlessly 
         combined_df = pd.concat(dfs, ignore_index=True)
 
-
         # 3. Iterate through rows and collect valid file paths + text descriptions
         # Using .itertuples() is significantly faster than standard pandas .iterrows()
         for row in combined_df.itertuples(index=False):
@@ -66,7 +69,7 @@ class RSICDDataset(Dataset):
             captions = getattr(row, "captions", None)
             
             if filename and pd.notna(captions):
-                full_img_path = os.path.join(root_dir, str(filename))
+                full_img_path = os.path.join(root_dir, "rsicd_images", str(filename))
                 
                 # Guard verification: Ensure the local image file actually exists on your storage drive
                 if os.path.exists(full_img_path):
@@ -86,6 +89,8 @@ class RSICDDataset(Dataset):
         # 4. Optional: Shuffle the pairs deterministically 
         # (Great practice for validation tracking stability across steps)
         random.Random(42).shuffle(self.data_pairs)
+
+        print(f"Data pairs: {len(self.data_pairs)}")
 
         if self.is_eval:
             grouped: Dict[str, List[str]] = dict()
@@ -186,7 +191,8 @@ class RSICDDataModule(LightningDataModule):
             num_workers: int = 4,
             pin_memory: bool = False,
             max_length: int = 24,
-            max_captions: int = 5
+            max_captions: int = 5,
+            eval_split: str = "test"
     ) -> None:
         super().__init__()
 
@@ -203,6 +209,7 @@ class RSICDDataModule(LightningDataModule):
         self.save_hyperparameters(logger=False, ignore=['tokenizer'])
         self.max_length = max_length
         self.max_captions = max_captions
+        self.eval_split = eval_split
 
         # --- TRAINING TRANSFORMS ---
         self.train_transforms = transforms.Compose([
@@ -244,13 +251,13 @@ class RSICDDataModule(LightningDataModule):
                 split="train",
             )
 
-            # 2. Map everything tagged "test" to be your validation set
+            # 2. Map everything tagged "val" to be your validation set
             self.data_val = RSICDDataset(
                 root_dir=self.hparams.data_dir,
                 tokenizer=self.tokenizer,
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
-                split="test",  # Re-routing the JSON "test" rows to validation
+                split=self.eval_split,  # Re-routing the JSON "test" rows to validation
                 max_captions=self.max_captions,
             )
 
@@ -262,7 +269,7 @@ class RSICDDataModule(LightningDataModule):
                 tokenizer=self.tokenizer,
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
-                split="test",
+                split=self.eval_split,
                 max_captions=self.max_captions,
             )
 
