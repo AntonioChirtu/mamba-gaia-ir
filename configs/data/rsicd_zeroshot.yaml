@@ -1,0 +1,10 @@
+# configs/data/rsicd_zeroshot.yaml
+
+defaults:
+  - rsicd
+
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: eleutherai/gpt-neox-20b
+
+max_length: 128

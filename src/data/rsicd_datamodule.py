@@ -1,34 +1,36 @@
-import os
-import json
-from typing import Any, Dict, Optional, Tuple, List
-
-import torch
-from lightning import LightningDataModule
-from torch.utils.data import DataLoader, Dataset, random_split
-from torchvision.transforms import transforms
-from PIL import Image
-from transformers import AutoTokenizer
-import random
-import pandas as pd
 import ast
+import json
+import os
+import random
+from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
+from lightning import LightningDataModule
 from omegaconf import DictConfig
-from hydra.utils import instantiate
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms import transforms
+
+from src.data.eval_collate import eval_collate_fn
 
 # Standard for many base Mamba models
 Image.MAX_IMAGE_PIXELS = None
 
-import torchvision.transforms.functional as F
 
 class RSICDDataset(Dataset):
-    """Custom Dataset for RSICD Information Retrieval."""
+    """Custom Dataset for RSICD Information Retrieval.
+    
+    Train mode (`split="train"`) returns one (image, caaption) pair at a
+    time. Eval mode groups all captions for the same image together."""
 
-    def __init__(self, root_dir: str, tokenizer: Any, transform: Optional[Any] = None, max_length: int = 77,
-                 split: str = "train"):
+    def __init__(self, root_dir: str, tokenizer: Any, transform: Any | None = None, max_length: int = 77,
+                 split: str = "train", max_captions: int = 5):
         self.root_dir = root_dir
         self.transform = transform
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.max_captions = max_captions
+        self.is_eval = split in ("val", "test", "combined_val")
         self.data_pairs = []
 
         if not os.path.exists(root_dir):
@@ -85,17 +87,28 @@ class RSICDDataset(Dataset):
         # (Great practice for validation tracking stability across steps)
         random.Random(42).shuffle(self.data_pairs)
 
+        if self.is_eval:
+            grouped: Dict[str, List[str]] = dict()
+            for path, caption in self.data_pairs:
+                grouped.setdefault(path, []).append(caption)
+            self.eval_records: List[Tuple[str, List[str]]] = list(grouped.items())
+
         print(f"📦 Custom Split [{split.upper()}]: Processed {len(csv_files_to_load)} CSV(s). "
-            f"Allocated {len(self.data_pairs)} valid image-caption samples.")
+            f"Allocated {len(self.eval_records) if self.is_eval else len(self.data_pairs)} valid samples.")
 
 
     def __len__(self):
-        return len(self.data_pairs)
+        return len(self.eval_records) if self.is_eval else len(self.data_pairs)
 
     def set_train(self, mode: bool):
         self.is_training = mode
 
     def __getitem__(self, idx):
+        if self.is_eval:
+            return self._get_eval_item(idx)
+        return self._get_train_item(idx)
+
+    def _get_train_item(self, idx):
         img_path, caption = self.data_pairs[idx]
 
         try:
@@ -107,7 +120,7 @@ class RSICDDataset(Dataset):
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
             # Safeguard against infinite loops if the whole dataset is broken
-            return self.__getitem__((idx + 1) % len(self.data_pairs))
+            return self._get_train_item((idx + 1) % len(self.data_pairs))
 
         # Transformations happen on an open, valid image object
         if self.transform:
@@ -130,6 +143,39 @@ class RSICDDataset(Dataset):
 
         return image, input_ids, caption
 
+    def _get_eval_item(self, idx):
+        img_path, captions = self.eval_records[idx]
+
+        try:
+            image = Image.open(img_path).convert("RGB")
+            image.load()
+        except Exception as e:
+            print(f"Error loading {img_path}: {e}")
+            return self._get_eval_item((idx + 1) % len(self.eval_records))
+
+        if self.transform:
+            image = self.transform(image)
+
+        eval_captions = list(captions[:self.max_captions])
+        if not eval_captions:
+            eval_captions = [""]
+        if len(eval_captions) < self.max_captions:
+            eval_captions = eval_captions + [eval_captions[-1]] * (
+                self.max_captions - len(eval_captions)
+            )
+
+        tokens = self.tokenizer(
+            eval_captions,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        input_ids = tokens.input_ids
+        attention_mask = tokens.attention_mask
+
+        return image, input_ids, attention_mask, eval_captions, idx
+
 
 class RSICDDataModule(LightningDataModule):
     def __init__(
@@ -140,6 +186,7 @@ class RSICDDataModule(LightningDataModule):
             num_workers: int = 4,
             pin_memory: bool = False,
             max_length: int = 24,
+            max_captions: int = 5
     ) -> None:
         super().__init__()
 
@@ -155,6 +202,7 @@ class RSICDDataModule(LightningDataModule):
         # Removed 'train_val_test_split' from hparams since RSICD specifies splits internally
         self.save_hyperparameters(logger=False, ignore=['tokenizer'])
         self.max_length = max_length
+        self.max_captions = max_captions
 
         # --- TRAINING TRANSFORMS ---
         self.train_transforms = transforms.Compose([
@@ -203,6 +251,7 @@ class RSICDDataModule(LightningDataModule):
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
                 split="test",  # Re-routing the JSON "test" rows to validation
+                max_captions=self.max_captions,
             )
 
         # --- TESTING STAGE ---
@@ -213,7 +262,8 @@ class RSICDDataModule(LightningDataModule):
                 tokenizer=self.tokenizer,
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
-                split="test"
+                split="test",
+                max_captions=self.max_captions,
             )
 
     def train_dataloader(self) -> DataLoader:
@@ -236,6 +286,7 @@ class RSICDDataModule(LightningDataModule):
             shuffle=False,
             persistent_workers=True,
             drop_last=False,  # Changed to False: You typically don't want to drop valuation steps
+            collate_fn=eval_collate_fn,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -245,4 +296,5 @@ class RSICDDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
+            collate_fn=eval_collate_fn,
         )
