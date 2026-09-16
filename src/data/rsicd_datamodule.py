@@ -2,6 +2,7 @@ import ast
 import json
 import os
 import random
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -73,13 +74,8 @@ class RSICDDataset(Dataset):
                 
                 # Guard verification: Ensure the local image file actually exists on your storage drive
                 if os.path.exists(full_img_path):
-                    # self.data_pairs.append((full_img_path, str(caption)))
-                    try:
-                        caption_list = ast.literal_eval(captions)
-                        if not isinstance(caption_list, list):
-                            caption_list = [captions]
-                    except (ValueError, SyntaxError):
-                        # Fallback if a row happens to be a single plain string instead of a list string
+                    caption_list = re.findall(r"'((?:[^'\\]|\\.)*)'", captions)
+                    if not caption_list:
                         caption_list = [captions]
 
                     valid_captions = [str(c) for c in caption_list if pd.notna(c) and str(c).strip()]
@@ -91,11 +87,11 @@ class RSICDDataset(Dataset):
         random.Random(42).shuffle(self.records)
 
         print(f"📦 Custom Split [{split.upper()}]: Processed {len(csv_files_to_load)} CSV(s). "
-            f"Allocated {len(self.eval_records) if self.is_eval else len(self.data_pairs)} images.")
+            f"Allocated {len(self.records)} images.")
 
 
     def __len__(self):
-        return len(self.eval_records) if self.is_eval else len(self.data_pairs)
+        return len(self.records)
 
     def set_train(self, mode: bool):
         self.is_training = mode

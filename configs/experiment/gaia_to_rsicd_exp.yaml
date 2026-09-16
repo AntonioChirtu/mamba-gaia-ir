@@ -25,6 +25,5 @@ trainer:
   precision: bf16-mixed
 
 model:
-  backbone_lr: 5e-5
   optimizer:
-    lr: 1.5e-4
+    lr: 5e-5
