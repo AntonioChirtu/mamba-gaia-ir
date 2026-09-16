@@ -69,7 +69,7 @@ class RSICDDataset(Dataset):
             captions = getattr(row, "captions", None)
             
             if filename and pd.notna(captions):
-                full_img_path = os.path.join(root_dir, "rsicd_images", str(filename))
+                full_img_path = os.path.join(root_dir, str(filename))
                 
                 # Guard verification: Ensure the local image file actually exists on your storage drive
                 if os.path.exists(full_img_path):
@@ -89,8 +89,6 @@ class RSICDDataset(Dataset):
         # 4. Optional: Shuffle the pairs deterministically 
         # (Great practice for validation tracking stability across steps)
         random.Random(42).shuffle(self.data_pairs)
-
-        print(f"Data pairs: {len(self.data_pairs)}")
 
         if self.is_eval:
             grouped: Dict[str, List[str]] = dict()
@@ -146,7 +144,7 @@ class RSICDDataset(Dataset):
         # If your model needs attention masks, grab it here too:
         attention_mask = tokens.attention_mask.squeeze(0)
 
-        return image, input_ids, caption
+        return image, input_ids, attention_mask, caption
 
     def _get_eval_item(self, idx):
         img_path, captions = self.eval_records[idx]
