@@ -38,6 +38,9 @@ class RSITMDDataset(Dataset):
         self.is_eval = split in ("val", "test")
         self.data_pairs = []
 
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"Unknown split type: {split}")
+
         if not os.path.exists(root_dir):
             raise FileNotFoundError(f"Root directory {root_dir} does not exist.")
 
@@ -51,7 +54,7 @@ class RSITMDDataset(Dataset):
         images_list = metadata_dict.get("images", [])
 
         for item in images_list:
-            if item["split"] != split:
+            if item.get("split") != split:
                 continue
 
             filename = item["filename"]
@@ -159,7 +162,6 @@ class RSITMDDataModule(LightningDataModule):
         pin_memory: bool = False,
         max_length: int = 24,
         max_captions: int = 5,
-        eval_split: str = "test",
     ) -> None:
         super().__init__()
 
@@ -175,7 +177,6 @@ class RSITMDDataModule(LightningDataModule):
         self.save_hyperparameters(logger=False, ignore=["tokenizer"])
         self.max_length = max_length
         self.max_captions = max_captions
-        self.eval_split = eval_split
 
         # --- TRAINING TRANSFORMS ---
         self.train_transforms = transforms.Compose(
@@ -231,7 +232,7 @@ class RSITMDDataModule(LightningDataModule):
                 tokenizer=self.tokenizer,
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
-                split=self.eval_split,
+                split="val",
                 max_captions=self.max_captions,
             )
 
@@ -243,7 +244,7 @@ class RSITMDDataModule(LightningDataModule):
                 tokenizer=self.tokenizer,
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
-                split=self.eval_split,
+                split="test",
                 max_captions=self.max_captions,
             )
 
