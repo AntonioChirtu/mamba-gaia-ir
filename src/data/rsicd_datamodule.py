@@ -31,7 +31,7 @@ class RSICDDataset(Dataset):
         self.max_length = max_length
         self.max_captions = max_captions
         self.is_eval = split in ("val", "test", "combined_val")
-        self.data_pairs = []
+        self.records: List[Tuple[str, List[str]]] = []
 
         if not os.path.exists(root_dir):
             raise FileNotFoundError(f"Root directory {root_dir} does not exist.")
@@ -82,22 +82,16 @@ class RSICDDataset(Dataset):
                         # Fallback if a row happens to be a single plain string instead of a list string
                         caption_list = [captions]
 
-                    for caption in caption_list:
-                        if pd.notna(caption) and str(caption).strip():
-                            self.data_pairs.append((full_img_path, str(caption)))
+                    valid_captions = [str(c) for c in caption_list if pd.notna(c) and str(c).strip()]
+                    if valid_captions:
+                        self.records.append((full_img_path, valid_captions))
 
         # 4. Optional: Shuffle the pairs deterministically 
         # (Great practice for validation tracking stability across steps)
-        random.Random(42).shuffle(self.data_pairs)
-
-        if self.is_eval:
-            grouped: Dict[str, List[str]] = dict()
-            for path, caption in self.data_pairs:
-                grouped.setdefault(path, []).append(caption)
-            self.eval_records: List[Tuple[str, List[str]]] = list(grouped.items())
+        random.Random(42).shuffle(self.records)
 
         print(f"📦 Custom Split [{split.upper()}]: Processed {len(csv_files_to_load)} CSV(s). "
-            f"Allocated {len(self.eval_records) if self.is_eval else len(self.data_pairs)} valid samples.")
+            f"Allocated {len(self.eval_records) if self.is_eval else len(self.data_pairs)} images.")
 
 
     def __len__(self):
@@ -106,13 +100,16 @@ class RSICDDataset(Dataset):
     def set_train(self, mode: bool):
         self.is_training = mode
 
+    def _pick_caption(self, captions: List[str]) -> str:
+        return random.choice(captions) if captions else ""
+
     def __getitem__(self, idx):
         if self.is_eval:
             return self._get_eval_item(idx)
         return self._get_train_item(idx)
 
     def _get_train_item(self, idx):
-        img_path, caption = self.data_pairs[idx]
+        img_path, captions = self.records[idx]
 
         try:
             # Corrected: Open the image without a context manager so it stays accessible
@@ -123,11 +120,13 @@ class RSICDDataset(Dataset):
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
             # Safeguard against infinite loops if the whole dataset is broken
-            return self._get_train_item((idx + 1) % len(self.data_pairs))
+            return self._get_train_item((idx + 1) % len(self.records))
 
         # Transformations happen on an open, valid image object
         if self.transform:
             image = self.transform(image)
+
+        caption = self._pick_caption(captions)
 
         # 2. Process Text (Tokenization)
         tokens = self.tokenizer(
@@ -147,14 +146,14 @@ class RSICDDataset(Dataset):
         return image, input_ids, attention_mask, caption
 
     def _get_eval_item(self, idx):
-        img_path, captions = self.eval_records[idx]
+        img_path, captions = self.records[idx]
 
         try:
             image = Image.open(img_path).convert("RGB")
             image.load()
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
-            return self._get_eval_item((idx + 1) % len(self.eval_records))
+            return self._get_eval_item((idx + 1) % len(self.records))
 
         if self.transform:
             image = self.transform(image)
