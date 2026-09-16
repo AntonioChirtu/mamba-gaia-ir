@@ -1,9 +1,9 @@
 _target_: src.data.rsicd_datamodule.RSICDDataModule
 data_dir: ${paths.data_dir}/RSICD
-batch_size: 512 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
+batch_size: 128 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
 num_workers: 4
 pin_memory: True
-max_length: 32
+max_length: 128
 tokenizer:
   _target_: transformers.AutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: gpt2
+  pretrained_model_name_or_path: eleutherai/gpt-neox-20b
