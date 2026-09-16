@@ -1,11 +1,8 @@
-import ast
 import json
 import os
 import random
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 from lightning import LightningDataModule
 from omegaconf import DictConfig
 from PIL import Image
@@ -20,12 +17,19 @@ Image.MAX_IMAGE_PIXELS = None
 
 class RSICDDataset(Dataset):
     """Custom Dataset for RSICD Information Retrieval.
-    
+
     Train mode (`split="train"`) returns one (image, caaption) pair at a
     time. Eval mode groups all captions for the same image together."""
 
-    def __init__(self, root_dir: str, tokenizer: Any, transform: Any | None = None, max_length: int = 77,
-                 split: str = "train", max_captions: int = 5):
+    def __init__(
+        self,
+        root_dir: str,
+        tokenizer: Any,
+        transform: Any | None = None,
+        max_length: int = 77,
+        split: str = "train",
+        max_captions: int = 5,
+    ):
         self.root_dir = root_dir
         self.transform = transform
         self.tokenizer = tokenizer
@@ -37,58 +41,48 @@ class RSICDDataset(Dataset):
         if not os.path.exists(root_dir):
             raise FileNotFoundError(f"Root directory {root_dir} does not exist.")
 
-        csv_files_to_load = []
+        metadata_path = os.path.join(root_dir, "metadata.json")
+        if not os.path.isfile(metadata_path):
+            raise FileNotFoundError(f"Metadata file not found at {metadata_path}")
 
-        if split == "train":
-            csv_files_to_load.append(os.path.join(root_dir, "train.csv"))
-        elif split == "val":
-            csv_files_to_load.append(os.path.join(root_dir, "val.csv"))
-        elif split == "test":
-            csv_files_to_load.append(os.path.join(root_dir, "test.csv"))
-        elif split == "combined_val":
-            # If we want the combined validation set, we load BOTH csv targets
-            # csv_files_to_load.append(os.path.join(root_dir, "train.csv"))
-            csv_files_to_load.append(os.path.join(root_dir, "val.csv"))
-            csv_files_to_load.append(os.path.join(root_dir, "test.csv"))
-        else:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata_dict = json.load(f)
+
+        images_list = metadata_dict.get("images", [])
+
+        if split not in ("train", "val", "test"):
             raise ValueError(f"Unknown split type: {split}")
-        
-        dfs = []
-        for csv_path in csv_files_to_load:
-            if not os.path.isfile(csv_path):
-                raise FileNotFoundError(f"Required CSV split file not found at {csv_path}")
-            dfs.append(pd.read_csv(csv_path))
-        
-        # Concatenate columns seamlessly 
-        combined_df = pd.concat(dfs, ignore_index=True)
 
-        # 3. Iterate through rows and collect valid file paths + text descriptions
-        # Using .itertuples() is significantly faster than standard pandas .iterrows()
-        for row in combined_df.itertuples(index=False):
-            # Fallback strings if columns are empty or malformed
-            filename = getattr(row, "filename", None)
-            captions = getattr(row, "captions", None)
-            
-            if filename and pd.notna(captions):
-                full_img_path = os.path.join(root_dir, str(filename))
-                
-                # Guard verification: Ensure the local image file actually exists on your storage drive
-                if os.path.exists(full_img_path):
-                    caption_list = re.findall(r"'((?:[^'\\]|\\.)*)'", captions)
-                    if not caption_list:
-                        caption_list = [captions]
+        wanted_splits = split
 
-                    valid_captions = [str(c) for c in caption_list if pd.notna(c) and str(c).strip()]
-                    if valid_captions:
-                        self.records.append((full_img_path, valid_captions))
+        for item in images_list:
+            if item.get("split") not in wanted_splits:
+                continue
 
-        # 4. Optional: Shuffle the pairs deterministically 
-        # (Great practice for validation tracking stability across steps)
+            filename = item.get("filename")
+            if not filename:
+                continue
+
+            full_img_path = os.path.join(root_dir, "images", filename)
+
+            if os.path.exists(full_img_path):
+                captions = [
+                    s["raw"]
+                    for s in item.get("sentences", [])
+                    if str(s.get("raw", "")).strip()
+                ]
+                if captions:
+                    self.records.append((full_img_path, captions))
+
+        if not self.records:
+            raise ValueError(
+                f"No samples found for split={split!r}. Check the 'split' values in {metadata_path}."
+            )
         random.Random(42).shuffle(self.records)
 
-        print(f"📦 Custom Split [{split.upper()}]: Processed {len(csv_files_to_load)} CSV(s). "
-            f"Allocated {len(self.records)} images.")
-
+        print(
+            f"📦 Custom Split [{split.upper()}]: Allocated {len(self.records)} images."
+        )
 
     def __len__(self):
         return len(self.records)
@@ -127,10 +121,10 @@ class RSICDDataset(Dataset):
         # 2. Process Text (Tokenization)
         tokens = self.tokenizer(
             caption,
-            padding='max_length',
+            padding="max_length",
             truncation=True,
             max_length=self.max_length,
-            return_tensors="pt"
+            return_tensors="pt",
         )
 
         # Squeeze out the batch dimension [1, seq_len] -> [seq_len]
@@ -154,7 +148,7 @@ class RSICDDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        eval_captions = list(captions[:self.max_captions])
+        eval_captions = list(captions[: self.max_captions])
         if not eval_captions:
             eval_captions = [""]
         if len(eval_captions) < self.max_captions:
@@ -164,7 +158,7 @@ class RSICDDataset(Dataset):
 
         tokens = self.tokenizer(
             eval_captions,
-            padding='max_length',
+            padding="max_length",
             truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
@@ -177,20 +171,21 @@ class RSICDDataset(Dataset):
 
 class RSICDDataModule(LightningDataModule):
     def __init__(
-            self,
-            tokenizer: Any,
-            data_dir: str = "data/RSICD",
-            batch_size: int = 32,
-            num_workers: int = 4,
-            pin_memory: bool = False,
-            max_length: int = 24,
-            max_captions: int = 5,
-            eval_split: str = "test"
+        self,
+        tokenizer: Any,
+        data_dir: str = "data/RSICD",
+        batch_size: int = 32,
+        num_workers: int = 4,
+        pin_memory: bool = False,
+        max_length: int = 24,
+        max_captions: int = 5,
+        eval_split: str = "test",
     ) -> None:
         super().__init__()
 
         if isinstance(tokenizer, (dict, DictConfig)):
             from hydra.utils import instantiate
+
             self.tokenizer = instantiate(tokenizer)
         else:
             self.tokenizer = tokenizer
@@ -199,32 +194,40 @@ class RSICDDataModule(LightningDataModule):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Removed 'train_val_test_split' from hparams since RSICD specifies splits internally
-        self.save_hyperparameters(logger=False, ignore=['tokenizer'])
+        self.save_hyperparameters(logger=False, ignore=["tokenizer"])
         self.max_length = max_length
         self.max_captions = max_captions
         self.eval_split = eval_split
 
         # --- TRAINING TRANSFORMS ---
-        self.train_transforms = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.9, 1.1)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.ToTensor(),
-            # Note: You can keep these CLIP normalization values,
-            # but standard ImageNet stats ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            # are also common if your vision backbone isn't CLIP.
-            transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]),
-            transforms.RandomErasing(p=0.2),
-        ])
+        self.train_transforms = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.9, 1.1)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.ToTensor(),
+                # Note: You can keep these CLIP normalization values,
+                # but standard ImageNet stats ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                # are also common if your vision backbone isn't CLIP.
+                transforms.Normalize(
+                    mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]
+                ),
+                transforms.RandomErasing(p=0.2),
+            ]
+        )
 
         # --- VAL/TEST TRANSFORMS ---
-        self.val_test_transforms = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757])
-        ])
+        self.val_test_transforms = transforms.Compose(
+            [
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]
+                ),
+            ]
+        )
 
         self.data_train: Optional[Dataset] = None
         self.data_val: Optional[Dataset] = None
