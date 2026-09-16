@@ -1,60 +1,34 @@
-import os
 import json
-from typing import Any, Dict, Optional, Tuple, List
-
-import torch
-from lightning import LightningDataModule
-from torch.utils.data import DataLoader, Dataset, random_split
-from torchvision.transforms import transforms
-from PIL import Image
-from transformers import AutoTokenizer
+import os
 import random
+from typing import Any, Optional
 
+from lightning import LightningDataModule
 from omegaconf import DictConfig
-from hydra.utils import instantiate
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms import transforms
+
+from src.data.eval_collate import eval_collate_fn
 
 # Standard for many base Mamba models
 Image.MAX_IMAGE_PIXELS = None
 
-import torchvision.transforms.functional as F
-
-
-class ResizeAndPad:
-    def __init__(self, target_size=(224, 224)):
-        self.target_size = target_size
-
-    def __call__(self, img):
-        w, h = img.size
-        target_w, target_h = self.target_size
-
-        # 1. Calculate the scaling factor to make the longest edge fit
-        ratio = min(target_w / w, target_h / h)
-        new_w = int(w * ratio)
-        new_h = int(h * ratio)
-
-        # 2. Resize to the new dimensions
-        # Using a tuple (new_h, new_w) avoids the size/max_size conflict
-        img = F.resize(img, (new_h, new_w), interpolation=Image.Resampling.LANCZOS)
-
-        # 3. Calculate padding to get to exactly 224x224
-        pad_w = target_w - new_w
-        pad_h = target_h - new_h
-
-        # padding is (left, top, right, bottom)
-        padding = (pad_w // 2, pad_h // 2, pad_w - (pad_w // 2), pad_h - (pad_h // 2))
-
-        return F.pad(img, padding, fill=0, padding_mode='constant')
-
 
 class RSITMDDataset(Dataset):
-    """Custom Dataset for RSITMD Information Retrieval."""
+    """Custom Dataset for RSITMD Information Retrieval.
+    
+    Train mode (`split="train"`) returns one (image, caaption) pair at a
+    time. Eval mode groups all captions for the same image together."""
 
-    def __init__(self, root_dir: str, tokenizer: Any, transform: Optional[Any] = None, max_length: int = 77,
-                 split: str = "train", test_ratio: float = 0.20):
+    def __init__(self, root_dir: str, tokenizer: Any, transform: Any | None = None, max_length: int = 77,
+                 split: str = "train", test_ratio: float = 0.20, , max_captions: int = 5):
         self.root_dir = root_dir
         self.transform = transform
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.max_captions = max_captions
+        self.is_eval = split in ("val", "test", "combined_val")
         self.data_pairs = []
 
         if not os.path.exists(root_dir):
@@ -64,31 +38,10 @@ class RSITMDDataset(Dataset):
         if not os.path.isfile(metadata_path):
             raise FileNotFoundError(f"Metadata file not found at {metadata_path}")
 
-        # Load the JSON file
         with open(metadata_path, 'r', encoding='utf-8') as f:
             metadata_dict = json.load(f)
 
-        # RSITMD structure contains a top-level "images" key
         images_list = metadata_dict.get("images", [])
-
-        # for item in images_list:
-        #     # Optional: Filter by split ('train', 'val', 'test') if needed
-        #     if item.get("split") != split:
-        #         continue
-        #
-        #     filename = item["filename"]
-        #
-        #     # Adjust this path logic depending on where your .tif files are stored
-        #     # (e.g., if they are in an "images/" subfolder, use os.path.join(root_dir, "images", filename))
-        #     full_img_path = os.path.join(root_dir, "images", filename)
-        #
-        #     if os.path.exists(full_img_path):
-        #         # Loop through all available captions for this specific image
-        #         for sentence_obj in item.get("sentences", []):
-        #             caption = sentence_obj["raw"]
-        #             self.data_pairs.append((full_img_path, caption))
-        #     else:
-        #         print(f"Warning: Image path not found: {full_img_path}")
 
         # Gather ALL valid image-caption pairs across the dataset first
         all_collected_pairs = []
@@ -109,41 +62,48 @@ class RSITMDDataset(Dataset):
         total_samples = len(all_collected_pairs)
         test_split_idx = int(total_samples * test_ratio)
 
-        # Assign the slices based on your target phase
         if split == "test" or split == "val":
-            # The first 20% goes to evaluation
+            # The first test_ratio fraction goes to evaluation
             self.data_pairs = all_collected_pairs[:test_split_idx]
         else:
-            # The remaining 80% goes to training
+            # The remaining goes to training
             self.data_pairs = all_collected_pairs[test_split_idx:]
 
-        print(f"📦 RSITMD Custom Split [{split.upper()}]: Allocated {len(self.data_pairs)} samples.")
+        if self.is_eval:
+            grouped: Dict[str, List[str]] = dict()
+            for path, caption in self.data_pairs:
+                grouped.setdefault(path, []).append(caption)
+            self.eval_records: List[Tuple[str, List[str]]] = list(grouped.items())
+
+        print(f"📦 RSITMD Custom Split [{split.upper()}]: "
+            f"Allocated {len(self.eval_records) if self.is_eval else len(self.data_pairs)} samples.")
+
 
     def __len__(self):
-        return len(self.data_pairs)
+        return len(self.eval_records) if self.is_eval else len(self.data_pairs)
 
     def set_train(self, mode: bool):
         self.is_training = mode
 
     def __getitem__(self, idx):
+        if self.is_eval:
+            return self._get_eval_item(idx)
+        return self._get_train_item(idx)
+
+    def _get_train_item(self, idx):
         img_path, caption = self.data_pairs[idx]
 
         try:
-            # Corrected: Open the image without a context manager so it stays accessible
             image = Image.open(img_path).convert("RGB")
-            # Optional: Force loading into memory immediately to catch corrupt files HERE
             image.load()
 
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
-            # Safeguard against infinite loops if the whole dataset is broken
-            return self.__getitem__((idx + 1) % len(self.data_pairs))
+            return self._get_train_item((idx + 1) % len(self.data_pairs))
 
-        # Transformations happen on an open, valid image object
         if self.transform:
             image = self.transform(image)
 
-        # 2. Process Text (Tokenization)
         tokens = self.tokenizer(
             caption,
             padding='max_length',
@@ -151,14 +111,43 @@ class RSITMDDataset(Dataset):
             max_length=self.max_length,
             return_tensors="pt"
         )
-
-        # Squeeze out the batch dimension [1, seq_len] -> [seq_len]
         input_ids = tokens.input_ids.squeeze(0)
-
-        # If your model needs attention masks, grab it here too:
         attention_mask = tokens.attention_mask.squeeze(0)
 
-        return image, input_ids, caption
+        return image, input_ids, attention_mask, caption
+
+    def _get_eval_item(self, idx):
+        img_path, captions = self.eval_records[idx]
+
+        try:
+            image = Image.open(img_path).convert("RGB")
+            image.load()
+        except Exception as e:
+            print(f"Error loading {img_path}: {e}")
+            return self._get_eval_item((idx + 1) % len(self.eval_records))
+
+        if self.transform:
+            image = self.transform(image)
+
+        eval_captions = list(captions[:self.max_captions])
+        if not eval_captions:
+            eval_captions = [""]
+        if len(eval_captions) < self.max_captions:
+            eval_captions = eval_captions + [eval_captions[-1]] * (
+                self.max_captions - len(eval_captions)
+            )
+
+        tokens = self.tokenizer(
+            eval_captions,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        input_ids = tokens.input_ids
+        attention_mask = tokens.attention_mask
+
+        return image, input_ids, attention_mask, eval_captions, idx
 
 
 class RSITMDDataModule(LightningDataModule):
@@ -175,7 +164,6 @@ class RSITMDDataModule(LightningDataModule):
         super().__init__()
 
         if isinstance(tokenizer, (dict, DictConfig)):
-            from hydra.utils import instantiate
             self.tokenizer = instantiate(tokenizer)
         else:
             self.tokenizer = tokenizer
@@ -187,6 +175,7 @@ class RSITMDDataModule(LightningDataModule):
         self.save_hyperparameters(logger=False, ignore=['tokenizer'])
         self.max_length = max_length
         self.test_ratio = test_ratio
+        self.max_captions = max_captions
 
         # --- TRAINING TRANSFORMS ---
         self.train_transforms = transforms.Compose([
@@ -236,7 +225,8 @@ class RSITMDDataModule(LightningDataModule):
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
                 split="test",  # Re-routing the JSON "test" rows to validation
-                test_ratio=self.hparams.test_ratio  # Pass to dataset
+                test_ratio=self.hparams.test_ratio,  # Pass to dataset
+                max_captions=self.max_captions,
             )
 
         # --- TESTING STAGE ---
@@ -247,7 +237,9 @@ class RSITMDDataModule(LightningDataModule):
                 tokenizer=self.tokenizer,
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
-                split="test"
+                split="test",
+                test_ratio=self.hparams.test_ratio,
+                max_captions=self.max_captions,
             )
 
     def train_dataloader(self) -> DataLoader:
@@ -270,6 +262,7 @@ class RSITMDDataModule(LightningDataModule):
             shuffle=False,
             persistent_workers=True,
             drop_last=False,  # Changed to False: You typically don't want to drop valuation steps
+            collate_fn=eval_collate_fn
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -279,4 +272,5 @@ class RSITMDDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
+            collate_fn=eval_collate_fn
         )
