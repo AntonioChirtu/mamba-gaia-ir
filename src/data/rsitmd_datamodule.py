@@ -1,7 +1,8 @@
 import json
 import os
-from typing import Any, Dict, List, Optional  # noqa: UP035
+from typing import Any, Dict, List, Optional, Tuple  # noqa: UP035
 
+from hydra.utils import instantiate
 from lightning import LightningDataModule
 from omegaconf import DictConfig
 from PIL import Image
@@ -16,12 +17,19 @@ Image.MAX_IMAGE_PIXELS = None
 
 class RSITMDDataset(Dataset):
     """Custom Dataset for RSITMD Information Retrieval.
-    
+
     Train mode (`split="train"`) returns one (image, caaption) pair at a
     time. Eval mode groups all captions for the same image together."""
 
-    def __init__(self, root_dir: str, tokenizer: Any, transform: Any | None = None, max_length: int = 77,
-                 split: str = "train", test_ratio: float = 0.20, max_captions: int = 5):
+    def __init__(
+        self,
+        root_dir: str,
+        tokenizer: Any,
+        transform: Any | None = None,
+        max_length: int = 77,
+        split: str = "train",
+        max_captions: int = 5,
+    ):
         self.root_dir = root_dir
         self.transform = transform
         self.tokenizer = tokenizer
@@ -37,7 +45,7 @@ class RSITMDDataset(Dataset):
         if not os.path.isfile(metadata_path):
             raise FileNotFoundError(f"Metadata file not found at {metadata_path}")
 
-        with open(metadata_path, 'r', encoding='utf-8') as f:
+        with open(metadata_path, "r", encoding="utf-8") as f:
             metadata_dict = json.load(f)
 
         images_list = metadata_dict.get("images", [])
@@ -55,7 +63,9 @@ class RSITMDDataset(Dataset):
                     self.data_pairs.append((full_img_path, caption))
 
         if not self.data_pairs:
-            raise ValueError(f"No samples found for split={split!r}. Check the 'split' values in {metadata_path}.")
+            raise ValueError(
+                f"No samples found for split={split!r}. Check the 'split' values in {metadata_path}."
+            )
 
         if self.is_eval:
             grouped: Dict[str, List[str]] = dict()
@@ -63,9 +73,10 @@ class RSITMDDataset(Dataset):
                 grouped.setdefault(path, []).append(caption)
             self.eval_records: List[Tuple[str, List[str]]] = list(grouped.items())
 
-        print(f"📦 RSITMD Custom Split [{split.upper()}]: "
-            f"Allocated {len(self.eval_records) if self.is_eval else len(self.data_pairs)} samples.")
-
+        print(
+            f"📦 RSITMD Custom Split [{split.upper()}]: "
+            f"Allocated {len(self.eval_records) if self.is_eval else len(self.data_pairs)} samples."
+        )
 
     def __len__(self):
         return len(self.eval_records) if self.is_eval else len(self.data_pairs)
@@ -94,10 +105,10 @@ class RSITMDDataset(Dataset):
 
         tokens = self.tokenizer(
             caption,
-            padding='max_length',
+            padding="max_length",
             truncation=True,
             max_length=self.max_length,
-            return_tensors="pt"
+            return_tensors="pt",
         )
         input_ids = tokens.input_ids.squeeze(0)
         attention_mask = tokens.attention_mask.squeeze(0)
@@ -117,7 +128,7 @@ class RSITMDDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
-        eval_captions = list(captions[:self.max_captions])
+        eval_captions = list(captions[: self.max_captions])
         if not eval_captions:
             eval_captions = [""]
         if len(eval_captions) < self.max_captions:
@@ -127,7 +138,7 @@ class RSITMDDataset(Dataset):
 
         tokens = self.tokenizer(
             eval_captions,
-            padding='max_length',
+            padding="max_length",
             truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
@@ -140,15 +151,15 @@ class RSITMDDataset(Dataset):
 
 class RSITMDDataModule(LightningDataModule):
     def __init__(
-            self,
-            tokenizer: Any,
-            data_dir: str = "data/RSITMD",
-            batch_size: int = 32,
-            num_workers: int = 4,
-            pin_memory: bool = False,
-            max_length: int = 24,
-            max_captions: int = 5,
-            eval_split: str = "test",
+        self,
+        tokenizer: Any,
+        data_dir: str = "data/RSITMD",
+        batch_size: int = 32,
+        num_workers: int = 4,
+        pin_memory: bool = False,
+        max_length: int = 24,
+        max_captions: int = 5,
+        eval_split: str = "test",
     ) -> None:
         super().__init__()
 
@@ -161,32 +172,40 @@ class RSITMDDataModule(LightningDataModule):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Removed 'train_val_test_split' from hparams since RSITMD specifies splits internally
-        self.save_hyperparameters(logger=False, ignore=['tokenizer'])
+        self.save_hyperparameters(logger=False, ignore=["tokenizer"])
         self.max_length = max_length
         self.max_captions = max_captions
         self.eval_split = eval_split
 
         # --- TRAINING TRANSFORMS ---
-        self.train_transforms = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.9, 1.1)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.ToTensor(),
-            # Note: You can keep these CLIP normalization values,
-            # but standard ImageNet stats ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            # are also common if your vision backbone isn't CLIP.
-            transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]),
-            transforms.RandomErasing(p=0.2),
-        ])
+        self.train_transforms = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.9, 1.1)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.ToTensor(),
+                # Note: You can keep these CLIP normalization values,
+                # but standard ImageNet stats ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                # are also common if your vision backbone isn't CLIP.
+                transforms.Normalize(
+                    mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]
+                ),
+                transforms.RandomErasing(p=0.2),
+            ]
+        )
 
         # --- VAL/TEST TRANSFORMS ---
-        self.val_test_transforms = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757])
-        ])
+        self.val_test_transforms = transforms.Compose(
+            [
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]
+                ),
+            ]
+        )
 
         self.data_train: Optional[Dataset] = None
         self.data_val: Optional[Dataset] = None
