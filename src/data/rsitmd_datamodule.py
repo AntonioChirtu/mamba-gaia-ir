@@ -1,7 +1,6 @@
 import json
 import os
-import random
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional  # noqa: UP035
 
 from lightning import LightningDataModule
 from omegaconf import DictConfig
@@ -22,13 +21,13 @@ class RSITMDDataset(Dataset):
     time. Eval mode groups all captions for the same image together."""
 
     def __init__(self, root_dir: str, tokenizer: Any, transform: Any | None = None, max_length: int = 77,
-                 split: str = "train", test_ratio: float = 0.20, , max_captions: int = 5):
+                 split: str = "train", test_ratio: float = 0.20, max_captions: int = 5):
         self.root_dir = root_dir
         self.transform = transform
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.max_captions = max_captions
-        self.is_eval = split in ("val", "test", "combined_val")
+        self.is_eval = split in ("val", "test")
         self.data_pairs = []
 
         if not os.path.exists(root_dir):
@@ -43,31 +42,20 @@ class RSITMDDataset(Dataset):
 
         images_list = metadata_dict.get("images", [])
 
-        # Gather ALL valid image-caption pairs across the dataset first
-        all_collected_pairs = []
         for item in images_list:
+            if item["split"] != split:
+                continue
+
             filename = item["filename"]
             full_img_path = os.path.join(root_dir, "images", filename)
 
             if os.path.exists(full_img_path):
                 for sentence_obj in item.get("sentences", []):
                     caption = sentence_obj["raw"]
-                    all_collected_pairs.append((full_img_path, caption))
+                    self.data_pairs.append((full_img_path, caption))
 
-        # Deterministically shuffle the pairs using a fixed seed
-        # This prevents train/test leakage across training epochs!
-        random.Random(42).shuffle(all_collected_pairs)
-
-        # Calculate split index
-        total_samples = len(all_collected_pairs)
-        test_split_idx = int(total_samples * test_ratio)
-
-        if split == "test" or split == "val":
-            # The first test_ratio fraction goes to evaluation
-            self.data_pairs = all_collected_pairs[:test_split_idx]
-        else:
-            # The remaining goes to training
-            self.data_pairs = all_collected_pairs[test_split_idx:]
+        if not self.data_pairs:
+            raise ValueError(f"No samples found for split={split!r}. Check the 'split' values in {metadata_path}.")
 
         if self.is_eval:
             grouped: Dict[str, List[str]] = dict()
@@ -159,7 +147,8 @@ class RSITMDDataModule(LightningDataModule):
             num_workers: int = 4,
             pin_memory: bool = False,
             max_length: int = 24,
-            test_ratio: float = 0.20,
+            max_captions: int = 5,
+            eval_split: str = "test",
     ) -> None:
         super().__init__()
 
@@ -174,8 +163,8 @@ class RSITMDDataModule(LightningDataModule):
         # Removed 'train_val_test_split' from hparams since RSITMD specifies splits internally
         self.save_hyperparameters(logger=False, ignore=['tokenizer'])
         self.max_length = max_length
-        self.test_ratio = test_ratio
         self.max_captions = max_captions
+        self.eval_split = eval_split
 
         # --- TRAINING TRANSFORMS ---
         self.train_transforms = transforms.Compose([
@@ -204,7 +193,7 @@ class RSITMDDataModule(LightningDataModule):
         self.data_test: Optional[Dataset] = None
 
     def setup(self, stage: Optional[str] = None) -> None:
-        """Instantiate datasets by mapping JSON 'test' split directly to validation."""
+        """Instantiate datasets using the metadata's own train/val/test split."""
 
         # --- TRAINING & VALIDATION STAGE ---
         if stage in ("fit", "validate") or stage is None:
@@ -215,17 +204,15 @@ class RSITMDDataModule(LightningDataModule):
                 transform=self.train_transforms,
                 max_length=self.hparams.max_length,
                 split="train",
-                test_ratio=self.hparams.test_ratio  # Pass to dataset
             )
 
-            # 2. Map everything tagged "test" to be your validation set
+            # 2. Map everything tagged eval_split to be your validation set
             self.data_val = RSITMDDataset(
                 root_dir=self.hparams.data_dir,
                 tokenizer=self.tokenizer,
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
-                split="test",  # Re-routing the JSON "test" rows to validation
-                test_ratio=self.hparams.test_ratio,  # Pass to dataset
+                split=self.eval_split,
                 max_captions=self.max_captions,
             )
 
@@ -237,8 +224,7 @@ class RSITMDDataModule(LightningDataModule):
                 tokenizer=self.tokenizer,
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
-                split="test",
-                test_ratio=self.hparams.test_ratio,
+                split=self.eval_split,
                 max_captions=self.max_captions,
             )
 
@@ -257,12 +243,12 @@ class RSITMDDataModule(LightningDataModule):
         return DataLoader(
             dataset=self.data_val,
             batch_size=self.hparams.batch_size,
-            num_workers=self.hparams.num_workers,  # Boosted from 4 to mirror hparams configuration safely
+            num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
             persistent_workers=True,
-            drop_last=False,  # Changed to False: You typically don't want to drop valuation steps
-            collate_fn=eval_collate_fn
+            drop_last=False,
+            collate_fn=eval_collate_fn,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -272,5 +258,5 @@ class RSITMDDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
-            collate_fn=eval_collate_fn
+            collate_fn=eval_collate_fn,
         )
