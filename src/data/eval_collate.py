@@ -8,10 +8,10 @@ import torch
 
 
 def eval_collate_fn(batch):
-    images, input_ids, attention_mask, captions_lists, idxs = zip(*batch)
+    images, image_ids, input_ids, attention_mask, captions_lists = zip(*batch)
     images = torch.stack(images)
+    image_ids = torch.as_tensor(image_ids, dtype=torch.long)
     input_ids = torch.stack(input_ids)
     attention_mask = torch.stack(attention_mask)
     flat_captions = [c for caps in captions_lists for c in caps]
-    idxs = torch.tensor(idxs, dtype=torch.long)
-    return images, input_ids, attention_mask, flat_captions, idxs
+    return images, image_ids, input_ids, attention_mask, flat_captions

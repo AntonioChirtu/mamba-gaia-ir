@@ -15,6 +15,96 @@ from src.data.eval_collate import eval_collate_fn
 Image.MAX_IMAGE_PIXELS = None
 
 
+from pathlib import Path
+from collections import Counter
+import re
+import unicodedata
+
+
+def normalize_caption(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = text.casefold()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def image_id(path: str) -> str:
+    # Prefer a dataset-relative path or official image ID.
+    # Avoid only using basename if different directories may reuse names.
+    return Path(path).as_posix().casefold()
+
+
+def normalize_pairs(pairs):
+    # print("PAIRS: ", pairs)
+    return [
+        {
+            "image": image_id(path),
+            "caption": normalize_caption(caption),
+            "path": str(path),
+        }
+        for path, caption in pairs
+    ]
+
+
+def audit_pair_splits(name_a, pairs_a, name_b, pairs_b, max_examples=10):
+    a = normalize_pairs(pairs_a)
+    b = normalize_pairs(pairs_b)
+
+    images_a = {row["image"] for row in a}
+    images_b = {row["image"] for row in b}
+
+    captions_a = {row["caption"] for row in a}
+    captions_b = {row["caption"] for row in b}
+
+    pair_keys_a = {
+        (row["image"], row["caption"])
+        for row in a
+    }
+    pair_keys_b = {
+        (row["image"], row["caption"])
+        for row in b
+    }
+
+    image_overlap = sorted(images_a & images_b)
+    caption_overlap = sorted(captions_a & captions_b)
+    pair_overlap = sorted(pair_keys_a & pair_keys_b)
+
+    captions_per_image_a = Counter(row["image"] for row in a)
+    captions_per_image_b = Counter(row["image"] for row in b)
+
+    print(f"\n{name_a} vs {name_b}")
+    print("-" * 60)
+    print(f"{name_a}: {len(a)} pairs, {len(images_a)} unique images")
+    print(f"{name_b}: {len(b)} pairs, {len(images_b)} unique images")
+    print(f"Overlapping image IDs: {len(image_overlap)}")
+    print(f"Overlapping exact pairs: {len(pair_overlap)}")
+    print(f"Overlapping normalized captions: {len(caption_overlap)}")
+
+    print(
+        f"{name_a} captions/image:",
+        dict(Counter(captions_per_image_a.values())),
+    )
+    print(
+        f"{name_b} captions/image:",
+        dict(Counter(captions_per_image_b.values())),
+    )
+
+    if image_overlap:
+        print("Example overlapping images:")
+        for x in image_overlap[:max_examples]:
+            print(" ", x)
+
+    if pair_overlap:
+        print("Example duplicated pairs:")
+        for image, caption in pair_overlap[:max_examples]:
+            print(f"  image={image!r}, caption={caption!r}")
+
+    return {
+        "image_overlap": image_overlap,
+        "pair_overlap": pair_overlap,
+        "caption_overlap": caption_overlap,
+    }
+
 class RSITMDDataset(Dataset):
     """Custom Dataset for RSITMD Information Retrieval.
 
@@ -35,10 +125,10 @@ class RSITMDDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.max_captions = max_captions
-        self.is_eval = split in ("val", "test")
+        self.is_eval = split == "test"
         self.data_pairs = []
 
-        if split not in ("train", "val", "test"):
+        if split not in ("train", "test"):
             raise ValueError(f"Unknown split type: {split}")
 
         if not os.path.exists(root_dir):
@@ -64,6 +154,17 @@ class RSITMDDataset(Dataset):
                 for sentence_obj in item.get("sentences", []):
                     caption = sentence_obj["raw"]
                     self.data_pairs.append((full_img_path, caption))
+
+        # Construct this once, after collecting every pair.
+        unique_image_paths = sorted({
+            path
+            for path, _ in self.data_pairs
+        })
+
+        self.image_to_id = {
+            path: numeric_id
+            for numeric_id, path in enumerate(unique_image_paths)
+        } 
 
         if not self.data_pairs:
             raise ValueError(
@@ -115,8 +216,9 @@ class RSITMDDataset(Dataset):
         )
         input_ids = tokens.input_ids.squeeze(0)
         attention_mask = tokens.attention_mask.squeeze(0)
+        image_id = self.image_to_id[img_path]
 
-        return image, input_ids, attention_mask, caption
+        return image, image_id, input_ids, attention_mask, caption
 
     def _get_eval_item(self, idx):
         img_path, captions = self.eval_records[idx]
@@ -126,7 +228,10 @@ class RSITMDDataset(Dataset):
             image.load()
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
-            return self._get_eval_item((idx + 1) % len(self.eval_records))
+            # return self._get_eval_item((idx + 1) % len(self.eval_records))
+            raise RuntimeError(
+                f"Failed to load image {img_path}"
+            ) from e
 
         if self.transform:
             image = self.transform(image)
@@ -148,8 +253,9 @@ class RSITMDDataset(Dataset):
         )
         input_ids = tokens.input_ids
         attention_mask = tokens.attention_mask
+        image_ids = self.image_to_id[img_path]
 
-        return image, input_ids, attention_mask, eval_captions, idx
+        return image, image_ids, input_ids, attention_mask, eval_captions
 
 
 class RSITMDDataModule(LightningDataModule):
@@ -232,9 +338,38 @@ class RSITMDDataModule(LightningDataModule):
                 tokenizer=self.tokenizer,
                 transform=self.val_test_transforms,
                 max_length=self.hparams.max_length,
-                split="val",
+                split="test",
                 max_captions=self.max_captions,
             )
+
+            train_test = audit_pair_splits(
+                "train",
+                self.data_train.data_pairs,
+                "test",
+                self.data_val.data_pairs,
+            )
+
+            for caption in train_test["caption_overlap"][:20]:
+                print(repr(caption))
+
+            from collections import defaultdict
+
+            caption_to_test_images = defaultdict(set)
+
+            for path, caption in self.data_val.data_pairs:
+                caption_to_test_images[normalize_caption(caption)].add(image_id(path))
+
+            ambiguous_test_captions = {
+                caption: images
+                for caption, images in caption_to_test_images.items()
+                if len(images) > 1
+            }
+
+            print(
+                "Test captions associated with multiple images:",
+                len(ambiguous_test_captions),
+            )
+
 
         # --- TESTING STAGE ---
         if stage == "test" or stage is None:

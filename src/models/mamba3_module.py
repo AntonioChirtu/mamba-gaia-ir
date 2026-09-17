@@ -7,37 +7,109 @@ from lightning import LightningModule
 from lightning.pytorch.loggers import WandbLogger
 from torchmetrics import MaxMetric, MeanMetric
 
+import torch
+import torch.nn.functional as F
+
+
+def multi_positive_cross_entropy(
+    logits: torch.Tensor,
+    positive_mask: torch.Tensor,
+) -> torch.Tensor:
+    if logits.shape != positive_mask.shape:
+        raise ValueError(
+            f"Shape mismatch: logits={tuple(logits.shape)}, "
+            f"mask={tuple(positive_mask.shape)}"
+        )
+
+    positive_counts = positive_mask.sum(dim=1)
+
+    if (positive_counts == 0).any():
+        bad_rows = (positive_counts == 0).nonzero(as_tuple=True)[0]
+        raise RuntimeError(f"Rows without a positive target: {bad_rows.tolist()}")
+
+    # Normalize each row across all its valid positives.
+    targets = positive_mask.float() / positive_counts.unsqueeze(1).float()
+
+    # Compute in float32 for numerical stability under mixed precision.
+    log_probs = F.log_softmax(logits.float(), dim=1)
+
+    return -(targets * log_probs).sum(dim=1).mean()
+
+
+# class RetrievalRecallWrapper:
+#     """
+#     Wrapper for official TorchMetrics RetrievalRecall that handles similarity matrices.
+#     """
+
+#     def __init__(self, k=1):
+#         self.k = k
+#         self.mean_metric = MeanMetric()
+
+#     def update(self, logits):
+#         """
+#         Update metric with similarity matrix.
+
+#         Args:
+#             logits: [batch_size, batch_size] similarity matrix
+#         """
+#         batch_size = logits.shape[0]
+#         target = torch.arange(batch_size, device=logits.device)
+
+#         # Get indices of top k matches
+#         _, top_k_indices = logits.topk(self.k, dim=1)
+
+#         # Check if target is in top_k (matches along dim 1)
+#         correct = (top_k_indices == target.view(-1, 1)).any(dim=1)
+
+#         # Ensure mean_metric is on same device as input
+#         if self.mean_metric.device != logits.device:
+#             self.mean_metric = self.mean_metric.to(logits.device)
+
+#         # Update your internal MeanMetric
+#         self.mean_metric.update(correct.float())
+
+#     def compute(self):
+#         return self.mean_metric.compute()
+
+#     def reset(self):
+#         self.mean_metric.reset()
+
 
 class RetrievalRecallWrapper:
-    """
-    Wrapper for official TorchMetrics RetrievalRecall that handles similarity matrices.
-    """
-
     def __init__(self, k=1):
         self.k = k
         self.mean_metric = MeanMetric()
 
-    def update(self, logits):
-        """
-        Update metric with similarity matrix.
+    def update(
+        self,
+        logits: torch.Tensor,
+        relevant: torch.Tensor | None = None,
+    ):
+        if relevant is None:
+            relevant = torch.eye(
+                logits.shape[0],
+                logits.shape[1],
+                dtype=torch.bool,
+                device=logits.device,
+            )
 
-        Args:
-            logits: [batch_size, batch_size] similarity matrix
-        """
-        batch_size = logits.shape[0]
-        target = torch.arange(batch_size, device=logits.device)
+        if logits.shape != relevant.shape:
+            raise ValueError(
+                f"Shape mismatch: logits={tuple(logits.shape)}, "
+                f"relevant={tuple(relevant.shape)}"
+            )
 
-        # Get indices of top k matches
-        _, top_k_indices = logits.topk(self.k, dim=1)
+        k = min(self.k, logits.shape[1])
+        top_k_indices = logits.topk(k, dim=1).indices
 
-        # Check if target is in top_k (matches along dim 1)
-        correct = (top_k_indices == target.view(-1, 1)).any(dim=1)
+        correct = relevant.gather(
+            dim=1,
+            index=top_k_indices,
+        ).any(dim=1)
 
-        # Ensure mean_metric is on same device as input
         if self.mean_metric.device != logits.device:
             self.mean_metric = self.mean_metric.to(logits.device)
 
-        # Update your internal MeanMetric
         self.mean_metric.update(correct.float())
 
     def compute(self):
@@ -142,17 +214,11 @@ class Mamba3LitModule(LightningModule):
 
         # TODO: Make more complicated contrastive loss?
         # loss function
-        self.criterion = torch.nn.CrossEntropyLoss()
 
         # metric objects for calculating and averaging accuracy across batches
-        self.train_recall = RetrievalRecallWrapper(k=1)
         # Separate metrics for I2T and T2I
         self.train_i2t_r1 = RetrievalRecallWrapper(k=1)
         self.train_t2i_r1 = RetrievalRecallWrapper(k=1)
-        self.val_i2t_r1 = RetrievalRecallWrapper(k=1)
-        self.val_t2i_r1 = RetrievalRecallWrapper(k=1)
-        self.val_i2t_r5 = RetrievalRecallWrapper(k=5)
-        self.val_t2i_r5 = RetrievalRecallWrapper(k=5)
 
         self.val_batch_i2t_r1 = RetrievalRecallWrapper(k=1)
         self.val_batch_t2i_r1 = RetrievalRecallWrapper(k=1)
@@ -160,7 +226,6 @@ class Mamba3LitModule(LightningModule):
         # for averaging loss across batches
         self.train_loss = MeanMetric()
         self.val_loss = MeanMetric()
-        self.test_loss = MeanMetric()
 
         # for tracking best so far validation accuracy
         self.val_i2t_r1_best = MaxMetric()
@@ -233,10 +298,6 @@ class Mamba3LitModule(LightningModule):
         # by default lightning executes validation step sanity checks before training starts,
         # so it's worth to make sure validation metrics don't store results from these checks
         self.val_loss.reset()
-        self.val_i2t_r1.reset()
-        self.val_t2i_r1.reset()
-        self.val_i2t_r5.reset()
-        self.val_t2i_r5.reset()
         self.val_i2t_r1_best.reset()
         self.val_t2i_r1_best.reset()
         self.val_mean_r1_best.reset()
@@ -244,10 +305,9 @@ class Mamba3LitModule(LightningModule):
         self.val_batch_t2i_r1.reset()
 
     def model_step(
-        self, batch: Tuple[torch.Tensor, torch.Tensor], raw_texts=None
-    ) -> (
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        | None
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        raw_texts=None,
     ):
         """Perform a single model step on a batch of data.
 
@@ -262,7 +322,7 @@ class Mamba3LitModule(LightningModule):
             - A tensor of target labels.
         """
 
-        images, texts, attention_mask = batch
+        images, image_ids, texts, attention_mask = batch
 
         img_emb = self.forward(images, modality="image")
         txt_emb = self.forward(
@@ -281,10 +341,24 @@ class Mamba3LitModule(LightningModule):
         logits_i2t = (img_emb @ txt_emb.t()) * scale
         logits_t2i = logits_i2t.t()
 
-        y = torch.arange(logits_i2t.shape[0], device=logits_i2t.device)
+        image_ids = image_ids.view(-1)
 
-        # Standard InfoNCE / CLIP Loss
-        loss = (self.criterion(logits_i2t, y) + self.criterion(logits_t2i, y)) / 2
+        positive_mask = image_ids[:, None].eq(image_ids[None, :])
+
+        assert logits_i2t.shape == positive_mask.shape
+        assert logits_t2i.shape == positive_mask.T.shape
+
+        loss_i2t = multi_positive_cross_entropy(
+            logits_i2t,
+            positive_mask,
+        )
+
+        loss_t2i = multi_positive_cross_entropy(
+            logits_t2i,
+            positive_mask.T,
+        )
+
+        loss = 0.5 * (loss_i2t + loss_t2i)
 
         # Defensive check
         if torch.isnan(loss) or torch.isinf(loss):
@@ -293,10 +367,12 @@ class Mamba3LitModule(LightningModule):
             )
             return None
 
-        return loss, logits_i2t, logits_t2i, img_emb, txt_emb
+        return loss, logits_i2t, logits_t2i, img_emb, txt_emb, positive_mask
 
     def training_step(
-        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch_idx: int,
     ) -> torch.Tensor:
         """Perform a single training step on a batch of data from the training set.
 
@@ -305,7 +381,39 @@ class Mamba3LitModule(LightningModule):
         :param batch_idx: The index of the current batch.
         :return: A tensor of losses between model predictions and targets.
         """
-        images, texts, attention_mask, captions = batch
+        images, image_ids, texts, attention_mask, captions = batch
+
+        from collections import Counter
+
+        counts = Counter(int(x) if hasattr(x, "item") else x for x in image_ids)
+
+        duplicate_images = {
+            image_id: count for image_id, count in counts.items() if count > 1
+        }
+
+        num_unique = len(counts)
+        num_duplicate_slots = len(image_ids) - num_unique
+
+        self.log(
+            "train/unique_images_per_batch",
+            float(num_unique),
+            on_step=True,
+            on_epoch=True,
+        )
+
+        self.log(
+            "train/duplicate_image_slots",
+            float(num_duplicate_slots),
+            on_step=True,
+            on_epoch=True,
+        )
+
+        self.log(
+            "train/images_with_multiple_captions",
+            float(len(duplicate_images)),
+            on_step=True,
+            on_epoch=True,
+        )
 
         # # Multiscale Augmentation Trigger
         # if batch_idx % 10 == 0:
@@ -321,35 +429,32 @@ class Mamba3LitModule(LightningModule):
         #     )
 
         # The model handles the embedding interpolation internally now!
-        result = self.model_step((images, texts, attention_mask), raw_texts=captions)
+        result = self.model_step(
+            (images, image_ids, texts, attention_mask), raw_texts=captions
+        )
 
         # Catch the NaN guard signal
         if result is None:
             return self.logit_scale * 0.0
-        loss, l_i2t, l_t2i, _, _ = result
+        loss, l_i2t, l_t2i, _, _, positive_mask = result
 
         # Update separate I2T and T2I metrics
-        self.train_i2t_r1.update(l_i2t)
-        self.train_t2i_r1.update(l_t2i)
+        self.train_i2t_r1.update(l_i2t, positive_mask)
+        self.train_t2i_r1.update(l_t2i, positive_mask.T)
+
+        off_diagonal_positives = positive_mask.sum() - positive_mask.diagonal().sum()
+
+        self.log(
+            "train/off_diagonal_positive_pairs",
+            off_diagonal_positives.float(),
+            on_step=True,
+            on_epoch=True,
+        )
 
         # update and log metrics
         self.train_loss(loss)
         self.log(
             "train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True
-        )
-        self.log(
-            "train/I2T_R1",
-            self.train_i2t_r1.compute(),
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-        )
-        self.log(
-            "train/T2I_R1",
-            self.train_t2i_r1.compute(),
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
         )
 
         # return loss or backpropagation will fail
@@ -357,14 +462,43 @@ class Mamba3LitModule(LightningModule):
 
     def on_train_epoch_end(self) -> None:
         "Lightning hook that is called when a training epoch ends."
+        train_i2t_r1 = torch.as_tensor(
+            self.train_i2t_r1.compute(),
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        train_t2i_r1 = torch.as_tensor(
+            self.train_t2i_r1.compute(),
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        self.log(
+            "train/I2T_R1",
+            train_i2t_r1,
+            prog_bar=True,
+            sync_dist=True,
+        )
+
+        self.log(
+            "train/T2I_R1",
+            train_t2i_r1,
+            prog_bar=True,
+            sync_dist=True,
+        )
         self.train_i2t_r1.reset()
         self.train_t2i_r1.reset()
 
         gc.collect()
-        torch.cuda.empty_cache()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def validation_step(
-        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch_idx: int,
     ) -> None:
         """Perform a single validation step on a batch of data from the validation set.
 
@@ -377,24 +511,27 @@ class Mamba3LitModule(LightningModule):
         # 5-caption protocol); anchor caption (index 0) drives loss/batch-r1
         # exactly as before, all C captions are encoded for the epoch-end
         # multi-relevant recall computation.
-        images, texts, attention_mask, text_strings, img_ids = batch
+        images, image_ids, texts, attention_mask, text_strings = batch
 
-        self.image_model.vit.image_size = self.base_size
+        if hasattr(self.image_model, "vit"):
+            self.image_model.vit.image_size = self.base_size
 
         B, C, L = texts.shape
         anchor_texts = texts[:, 0, :]
         anchor_mask = attention_mask[:, 0, :]
-        anchor_texts_str = text_strings[0::C] # index 0 of each image's C captions
+        anchor_texts_str = text_strings[0::C]  # index 0 of each image's C captions
 
-        result = self.model_step((images, anchor_texts, anchor_mask), raw_texts=anchor_texts_str)
+        result = self.model_step(
+            (images, image_ids, anchor_texts, anchor_mask), raw_texts=anchor_texts_str
+        )
 
         # If validation batch is broken, exit early to protect global metric tracking
         if result is None:
             return
-        loss, l_i2t, l_t2i, img_emb, txt_emb = result
+        loss, l_i2t, l_t2i, img_emb, txt_emb, positive_mask = result
 
-        self.val_batch_i2t_r1.update(l_i2t)
-        self.val_batch_t2i_r1.update(l_t2i)
+        self.val_batch_i2t_r1.update(l_i2t, positive_mask)
+        self.val_batch_t2i_r1.update(l_t2i, positive_mask.T)
 
         if img_emb.ndim == 1:
             img_emb = img_emb.unsqueeze(0)
@@ -403,15 +540,18 @@ class Mamba3LitModule(LightningModule):
         texts_flat = texts.reshape(B * C, L)
         mask_flat = attention_mask.reshape(B * C, L)
         txt_emb_all = self.forward(
-            texts_flat, modality="text", attention_mask=mask_flat, raw_texts=text_strings
+            texts_flat,
+            modality="text",
+            attention_mask=mask_flat,
+            raw_texts=text_strings,
         )
         txt_emb_all = torch.nn.functional.normalize(txt_emb_all, p=2, dim=-1)
 
-        txt_img_ids = img_ids.to(img_emb.device).repeat_interleave(C)
+        txt_img_ids = image_ids.to(img_emb.device).repeat_interleave(C)
 
         self.val_outputs["img_embs"].append(img_emb.detach().cpu())
         self.val_outputs["txt_embs"].append(txt_emb_all.detach().cpu())
-        self.val_outputs["img_ids"].append(img_ids.detach().cpu())
+        self.val_outputs["img_ids"].append(image_ids.detach().cpu())
         self.val_outputs["txt_img_ids"].append(txt_img_ids.detach().cpu())
         self.val_outputs["raw_texts"].extend(text_strings)
 
@@ -501,12 +641,32 @@ class Mamba3LitModule(LightningModule):
                 f"Expected 2-D similarity matrix, got {sim_matrix.shape}"
             )
 
+        if len(all_strings) != sim_matrix.shape[1]:
+            raise RuntimeError(
+                f"Embedding/string count mismatch: "
+                f"{sim_matrix.shape[1]} text embeddings vs "
+                f"{len(all_strings)} strings"
+            )
+
         # Multi-relevant ground truth: text j is relevant to image i iff they
         # share the same source-image id (standard 5-captions-per-image
         # protocol), not just the diagonal
         relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(
             0
         )  # [N_img, N_txt]
+
+        if relevant.shape != sim_matrix.shape:
+            raise RuntimeError(
+                f"Relevance/similarity mismatch: "
+                f"relevant={tuple(relevant.shape)}, "
+                f"similarity={tuple(sim_matrix.shape)}"
+            )
+
+        if not relevant.any(dim=1).all():
+            raise RuntimeError("At least one image has no relevant caption.")
+
+        if not relevant.any(dim=0).all():
+            raise RuntimeError("At least one caption has no owning image.")
 
         # 3. Calculate R@1, R@5, R@10 for both directions
         val_results = {}
@@ -607,7 +767,7 @@ class Mamba3LitModule(LightningModule):
 
     def test_step(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor],
+        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
@@ -618,21 +778,24 @@ class Mamba3LitModule(LightningModule):
         :param batch_idx: The index of the current batch.
         """
 
-        images, texts, attention_mask, text_strings, img_ids = batch
+        images, image_ids, texts, attention_mask, text_strings = batch
 
-        self.image_model.vit.image_size = self.base_size
+        if hasattr(self.image_model, "vit"):
+            self.image_model.vit.image_size = self.base_size
 
         B, C, L = texts.shape
         anchor_texts = texts[:, 0, :]
         anchor_mask = attention_mask[:, 0, :]
-        anchor_texts_str = text_strings[0::C] # index 0 of each image's C captions
+        anchor_texts_str = text_strings[0::C]  # index 0 of each image's C captions
 
-        result = self.model_step((images, anchor_texts, anchor_mask), raw_texts=anchor_texts_str)
+        result = self.model_step(
+            (images, image_ids, anchor_texts, anchor_mask), raw_texts=anchor_texts_str
+        )
 
         # If validation batch is broken, exit early to protect global metric tracking
         if result is None:
             return
-        loss, l_i2t, l_t2i, img_emb, txt_emb = result
+        loss, l_i2t, l_t2i, img_emb, txt_emb, _ = result
 
         if img_emb.ndim == 1:
             img_emb = img_emb.unsqueeze(0)
@@ -640,15 +803,18 @@ class Mamba3LitModule(LightningModule):
         texts_flat = texts.reshape(B * C, L)
         mask_flat = attention_mask.reshape(B * C, L)
         txt_emb_all = self.forward(
-            texts_flat, modality="text", attention_mask=mask_flat, raw_texts=text_strings
+            texts_flat,
+            modality="text",
+            attention_mask=mask_flat,
+            raw_texts=text_strings,
         )
         txt_emb_all = torch.nn.functional.normalize(txt_emb_all, p=2, dim=-1)
 
-        txt_img_ids = img_ids.to(img_emb.device).repeat_interleave(C)
+        txt_img_ids = image_ids.to(img_emb.device).repeat_interleave(C)
 
         self.test_outputs["img_embs"].append(img_emb.detach().cpu())
         self.test_outputs["txt_embs"].append(txt_emb_all.detach().cpu())
-        self.test_outputs["img_ids"].append(img_ids.detach().cpu())
+        self.test_outputs["img_ids"].append(image_ids.detach().cpu())
         self.test_outputs["txt_img_ids"].append(txt_img_ids.detach().cpu())
         self.test_outputs["raw_texts"].extend(text_strings)
 
@@ -745,6 +911,19 @@ class Mamba3LitModule(LightningModule):
         relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(
             0
         )  # [N_img, N_txt]
+
+        if relevant.shape != sim_matrix.shape:
+            raise RuntimeError(
+                f"Relevance/similarity mismatch: "
+                f"relevant={tuple(relevant.shape)}, "
+                f"similarity={tuple(sim_matrix.shape)}"
+            )
+
+        if not relevant.any(dim=1).all():
+            raise RuntimeError("At least one image has no relevant caption.")
+
+        if not relevant.any(dim=0).all():
+            raise RuntimeError("At least one caption has no owning image.")
 
         # 3. Calculate R@1, R@5, R@10 for both directions
         test_results = {}
