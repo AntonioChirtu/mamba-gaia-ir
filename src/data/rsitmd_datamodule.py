@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import transforms
 
 from src.data.eval_collate import eval_collate_fn
+import random
 
 # Standard for many base Mamba models
 Image.MAX_IMAGE_PIXELS = None
@@ -171,22 +172,30 @@ class RSITMDDataset(Dataset):
                 f"No samples found for split={split!r}. Check the 'split' values in {metadata_path}."
             )
 
-        if self.is_eval:
-            grouped: Dict[str, List[str]] = dict()
-            for path, caption in self.data_pairs:
-                grouped.setdefault(path, []).append(caption)
-            self.eval_records: List[Tuple[str, List[str]]] = list(grouped.items())
+        grouped: Dict[str, List[str]] = dict()
+        for path, caption in self.data_pairs:
+            grouped.setdefault(path, []).append(caption)
+        self.records: List[Tuple[str, List[str]]] = list(grouped.items())
+
+        self.is_training = not self.is_eval
 
         print(
             f"📦 RSITMD Custom Split [{split.upper()}]: "
-            f"Allocated {len(self.eval_records) if self.is_eval else len(self.data_pairs)} samples."
+            f"Allocated {len(self.records)} samples."
         )
 
     def __len__(self):
-        return len(self.eval_records) if self.is_eval else len(self.data_pairs)
+        return len(self.records)
 
     def set_train(self, mode: bool):
         self.is_training = mode
+
+    def _pick_caption(self, captions: List[str]) -> str:
+        if not captions:
+            return ""
+        if self.is_training:
+            return random.choice(captions)
+        return captions[0]
 
     def __getitem__(self, idx):
         if self.is_eval:
@@ -194,7 +203,7 @@ class RSITMDDataset(Dataset):
         return self._get_train_item(idx)
 
     def _get_train_item(self, idx):
-        img_path, caption = self.data_pairs[idx]
+        img_path, captions = self.records[idx]
 
         try:
             image = Image.open(img_path).convert("RGB")
@@ -202,10 +211,12 @@ class RSITMDDataset(Dataset):
 
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
-            return self._get_train_item((idx + 1) % len(self.data_pairs))
+            return self._get_train_item((idx + 1) % len(self.records))
 
         if self.transform:
             image = self.transform(image)
+
+        caption = self._pick_caption(captions)
 
         tokens = self.tokenizer(
             caption,
@@ -221,14 +232,13 @@ class RSITMDDataset(Dataset):
         return image, image_id, input_ids, attention_mask, caption
 
     def _get_eval_item(self, idx):
-        img_path, captions = self.eval_records[idx]
+        img_path, captions = self.records[idx]
 
         try:
             image = Image.open(img_path).convert("RGB")
             image.load()
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
-            # return self._get_eval_item((idx + 1) % len(self.eval_records))
             raise RuntimeError(
                 f"Failed to load image {img_path}"
             ) from e

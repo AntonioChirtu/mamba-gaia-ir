@@ -214,6 +214,7 @@ class Mamba3LitModule(LightningModule):
 
         # TODO: Make more complicated contrastive loss?
         # loss function
+        self.criterion = torch.nn.CrossEntropyLoss()
 
         # metric objects for calculating and averaging accuracy across batches
         # Separate metrics for I2T and T2I
@@ -348,15 +349,19 @@ class Mamba3LitModule(LightningModule):
         assert logits_i2t.shape == positive_mask.shape
         assert logits_t2i.shape == positive_mask.T.shape
 
-        loss_i2t = multi_positive_cross_entropy(
-            logits_i2t,
-            positive_mask,
-        )
+        # loss_i2t = multi_positive_cross_entropy(
+        #     logits_i2t,
+        #     positive_mask,
+        # )
 
-        loss_t2i = multi_positive_cross_entropy(
-            logits_t2i,
-            positive_mask.T,
-        )
+        # loss_t2i = multi_positive_cross_entropy(
+        #     logits_t2i,
+        #     positive_mask.T,
+        # )
+
+        y = torch.arange(logits_i2t.shape[0], device=logits_i2t.device)
+        loss_i2t = self.criterion(logits_i2t, y)
+        loss_t2i = self.criterion(logits_t2i, y)
 
         loss = 0.5 * (loss_i2t + loss_t2i)
 
