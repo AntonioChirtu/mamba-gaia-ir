@@ -1,0 +1,81 @@
+# @package _global_
+# RSITMD is small (~4.7k train images x 5 captions, ~500 test images) and every
+# run so far has overfit. This sweep searches regularization/capacity-control
+# knobs with Optuna's TPE sampler, and prunes clearly-bad trials early via
+# PyTorchLightningPruningCallback (configs/callbacks/optuna_pruning.yaml) so a
+# 50-trial x 50-epoch budget doesn't cost 50x the full training time.
+#
+# python src/train.py --multirun hparams_search=rsitmd_overfit_sweep experiment=gaia_to_rsitmd_exp
+
+optimized_metric: "val/mean_R1_best"
+
+defaults:
+  - override /hydra/sweeper: optuna
+
+tags: ["rsitmd", "mamba3", "optuna_sweep"]
+
+data:
+  batch_size: 256
+
+model:
+  image_net:
+    freeze_backbone: false
+    dropout: 0.3
+
+  text_net:
+    dropout: 0.3
+    d_state: 64
+    n_layers: 1
+    expand: 2
+    d_conv: 4
+    headdim: 16
+
+  # Ensure ReduceLROnPlateau can act before early stopping.
+  scheduler:
+    patience: 2
+
+seed: 12345
+
+trainer:
+  min_epochs: 5
+  max_epochs: 50
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: "norm"
+
+callbacks:
+  early_stopping:
+    patience: 8  # aggressive relative to the default_optuna.yaml's 100 - only 50 epochs/trial here
+  optuna_pruning:
+    monitor: "val/mean_R1"
+
+hydra:
+  mode: MULTIRUN
+
+  job:
+    env_set:
+      WANDB_RUN_GROUP: "${oc.select:hydra.sweeper.study_name,'rsitmd_overfit_sweep'}"
+
+  sweeper:
+    storage: sqlite:///rsitmd_overfit_sweep_arch.db
+    study_name: rsitmd_overfit_sweep_arch
+    n_jobs: 1
+    direction: maximize
+    n_trials: 1
+
+    sampler:
+      _target_: optuna.samplers.TPESampler
+      seed: 12345
+
+    params:
+      # model.optimizer.lr: tag(log, interval(5e-5, 1.4e-4))
+      # model.optimizer.weight_decay: tag(log, interval(0.02, 0.1))
+      # model.text_net.dropout: interval(0.2, 0.4)
+      # model.image_net.dropout: interval(0.2, 0.4)
+      # trainer.gradient_clip_val: 0.5
+      # data.batch_size: 256
+
+      model.optimizer.lr: tag(log, interval(5e-5, 1.4e-4))
+      model.optimizer.weight_decay: tag(log, interval(0.02, 0.1))
+      model.image_net.d_model: choice(256, 384, 512)
+      model.text_net.d_model: choice(256, 384, 512, 768)
+      data.max_length: choice(24, 32)

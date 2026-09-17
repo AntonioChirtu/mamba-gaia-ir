@@ -4,6 +4,11 @@ batch_size: 256 # Needs to be divisible by the number of devices (e.g., if in a 
 num_workers: 4
 pin_memory: True
 max_length: 24
+
 tokenizer:
   _target_: transformers.AutoTokenizer.from_pretrained
   pretrained_model_name_or_path: eleutherai/gpt-neox-20b
+
+# tokenizer:
+#   _target_: transformers.CLIPTokenizer.from_pretrained
+#   pretrained_model_name_or_path: openai/clip-vit-base-patch32

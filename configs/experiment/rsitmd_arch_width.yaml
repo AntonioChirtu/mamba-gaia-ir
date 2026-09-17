@@ -1,0 +1,66 @@
+# @package _global_
+
+defaults:
+  - override /hydra/sweeper: basic
+  - override /data: rsitmd
+  - override /model: mamba3
+  - override /callbacks: default
+  - override /trainer: default
+
+architecture_phase: width
+optimized_metric: "val/mean_R1_best"
+
+tags:
+  - rsitmd
+  - mamba3
+  - architecture-search
+  - width-grid
+
+seed: 12345
+
+data:
+  batch_size: 256
+
+model:
+  image_net:
+    freeze_backbone: false
+    dropout: 0.3
+
+  text_net:
+    dropout: 0.3
+    d_state: 64
+    n_layers: 1
+    expand: 2
+    d_conv: 4
+    headdim: 16
+
+  optimizer:
+    lr: 0.0001
+    weight_decay: 0.03
+
+  scheduler:
+    patience: 2
+
+trainer:
+  min_epochs: 5
+  max_epochs: 50
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+
+callbacks:
+  early_stopping:
+    monitor: "val/mean_R1"
+    mode: max
+    patience: 5
+
+hydra:
+  mode: MULTIRUN
+
+  job:
+    env_set:
+      WANDB_RUN_GROUP: "rsitmd_arch_width_grid"
+
+  sweeper:
+    params:
+      model.image_net.d_model: "256,384,512"
+      model.text_net.d_model: "256,384,512,768"
