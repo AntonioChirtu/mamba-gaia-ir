@@ -227,9 +227,8 @@ class RSITMDDataset(Dataset):
         )
         input_ids = tokens.input_ids.squeeze(0)
         attention_mask = tokens.attention_mask.squeeze(0)
-        image_id = self.image_to_id[img_path]
 
-        return image, image_id, input_ids, attention_mask, caption
+        return image, input_ids, attention_mask, caption
 
     def _get_eval_item(self, idx):
         img_path, captions = self.records[idx]

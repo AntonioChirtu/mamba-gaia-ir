@@ -1,16 +1,16 @@
-import os
 import glob
 import json
-from typing import Any, Optional, Tuple, List
+import os
+import random
+from typing import Any, List, Optional, Tuple
 
-import torch
 from lightning import LightningDataModule
+from omegaconf import DictConfig
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import transforms
-from PIL import Image
-import random
 
-from omegaconf import DictConfig
+from src.data.eval_collate import eval_collate_fn
 
 # Standard for many base Mamba models
 Image.MAX_IMAGE_PIXELS = None
@@ -177,18 +177,8 @@ class GAIADataset(Dataset):
 
         input_ids = tokens.input_ids
         attention_mask = tokens.attention_mask
-        return image, input_ids, attention_mask, eval_captions, idx
+        return image, idx, input_ids, attention_mask, eval_captions
 
-def eval_collate_fn(batch):
-    """Collate for val/test: keeps per-image caption lists flat (image-major
-    order) instead of letting default_collate transpose them."""
-    images, input_ids, attention_mask, captions_lists, idxs = zip(*batch)
-    images = torch.stack(images)
-    input_ids = torch.stack(input_ids)
-    attention_mask = torch.stack(attention_mask)
-    flat_captions = [c for caps in captions_lists for c in caps]
-    idxs = torch.tensor(idxs, dtype=torch.long)
-    return images, input_ids, attention_mask, flat_captions, idxs
 
 
 class GAIADataModule(LightningDataModule):

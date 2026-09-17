@@ -307,7 +307,7 @@ class Mamba3LitModule(LightningModule):
 
     def model_step(
         self,
-        batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         raw_texts=None,
     ):
         """Perform a single model step on a batch of data.
@@ -323,7 +323,7 @@ class Mamba3LitModule(LightningModule):
             - A tensor of target labels.
         """
 
-        images, image_ids, texts, attention_mask = batch
+        images, texts, attention_mask = batch
 
         img_emb = self.forward(images, modality="image")
         txt_emb = self.forward(
@@ -342,23 +342,7 @@ class Mamba3LitModule(LightningModule):
         logits_i2t = (img_emb @ txt_emb.t()) * scale
         logits_t2i = logits_i2t.t()
 
-        image_ids = image_ids.view(-1)
-
-        positive_mask = image_ids[:, None].eq(image_ids[None, :])
-
-        assert logits_i2t.shape == positive_mask.shape
-        assert logits_t2i.shape == positive_mask.T.shape
-
-        # loss_i2t = multi_positive_cross_entropy(
-        #     logits_i2t,
-        #     positive_mask,
-        # )
-
-        # loss_t2i = multi_positive_cross_entropy(
-        #     logits_t2i,
-        #     positive_mask.T,
-        # )
-
+        # Each row's positive is the diagonal, so plain InfoNCE is fine
         y = torch.arange(logits_i2t.shape[0], device=logits_i2t.device)
         loss_i2t = self.criterion(logits_i2t, y)
         loss_t2i = self.criterion(logits_t2i, y)
@@ -372,11 +356,11 @@ class Mamba3LitModule(LightningModule):
             )
             return None
 
-        return loss, logits_i2t, logits_t2i, img_emb, txt_emb, positive_mask
+        return loss, logits_i2t, logits_t2i, img_emb, txt_emb
 
     def training_step(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         batch_idx: int,
     ) -> torch.Tensor:
         """Perform a single training step on a batch of data from the training set.
@@ -386,39 +370,7 @@ class Mamba3LitModule(LightningModule):
         :param batch_idx: The index of the current batch.
         :return: A tensor of losses between model predictions and targets.
         """
-        images, image_ids, texts, attention_mask, captions = batch
-
-        from collections import Counter
-
-        counts = Counter(int(x) if hasattr(x, "item") else x for x in image_ids)
-
-        duplicate_images = {
-            image_id: count for image_id, count in counts.items() if count > 1
-        }
-
-        num_unique = len(counts)
-        num_duplicate_slots = len(image_ids) - num_unique
-
-        self.log(
-            "train/unique_images_per_batch",
-            float(num_unique),
-            on_step=True,
-            on_epoch=True,
-        )
-
-        self.log(
-            "train/duplicate_image_slots",
-            float(num_duplicate_slots),
-            on_step=True,
-            on_epoch=True,
-        )
-
-        self.log(
-            "train/images_with_multiple_captions",
-            float(len(duplicate_images)),
-            on_step=True,
-            on_epoch=True,
-        )
+        images, texts, attention_mask, captions = batch
 
         # # Multiscale Augmentation Trigger
         # if batch_idx % 10 == 0:
@@ -434,27 +386,16 @@ class Mamba3LitModule(LightningModule):
         #     )
 
         # The model handles the embedding interpolation internally now!
-        result = self.model_step(
-            (images, image_ids, texts, attention_mask), raw_texts=captions
-        )
+        result = self.model_step((images, texts, attention_mask), raw_texts=captions)
 
         # Catch the NaN guard signal
         if result is None:
             return self.logit_scale * 0.0
-        loss, l_i2t, l_t2i, _, _, positive_mask = result
+        loss, l_i2t, l_t2i, _, _ = result
 
         # Update separate I2T and T2I metrics
-        self.train_i2t_r1.update(l_i2t, positive_mask)
-        self.train_t2i_r1.update(l_t2i, positive_mask.T)
-
-        off_diagonal_positives = positive_mask.sum() - positive_mask.diagonal().sum()
-
-        self.log(
-            "train/off_diagonal_positive_pairs",
-            off_diagonal_positives.float(),
-            on_step=True,
-            on_epoch=True,
-        )
+        self.train_i2t_r1.update(l_i2t)
+        self.train_t2i_r1.update(l_t2i)
 
         # update and log metrics
         self.train_loss(loss)
@@ -527,16 +468,16 @@ class Mamba3LitModule(LightningModule):
         anchor_texts_str = text_strings[0::C]  # index 0 of each image's C captions
 
         result = self.model_step(
-            (images, image_ids, anchor_texts, anchor_mask), raw_texts=anchor_texts_str
+            (images, anchor_texts, anchor_mask), raw_texts=anchor_texts_str
         )
 
         # If validation batch is broken, exit early to protect global metric tracking
         if result is None:
             return
-        loss, l_i2t, l_t2i, img_emb, txt_emb, positive_mask = result
+        loss, l_i2t, l_t2i, img_emb, txt_emb = result
 
-        self.val_batch_i2t_r1.update(l_i2t, positive_mask)
-        self.val_batch_t2i_r1.update(l_t2i, positive_mask.T)
+        self.val_batch_i2t_r1.update(l_i2t)
+        self.val_batch_t2i_r1.update(l_t2i)
 
         if img_emb.ndim == 1:
             img_emb = img_emb.unsqueeze(0)
@@ -794,13 +735,13 @@ class Mamba3LitModule(LightningModule):
         anchor_texts_str = text_strings[0::C]  # index 0 of each image's C captions
 
         result = self.model_step(
-            (images, image_ids, anchor_texts, anchor_mask), raw_texts=anchor_texts_str
+            (images, anchor_texts, anchor_mask), raw_texts=anchor_texts_str
         )
 
         # If validation batch is broken, exit early to protect global metric tracking
         if result is None:
             return
-        loss, l_i2t, l_t2i, img_emb, txt_emb, _ = result
+        loss, l_i2t, l_t2i, img_emb, txt_emb = result
 
         if img_emb.ndim == 1:
             img_emb = img_emb.unsqueeze(0)
