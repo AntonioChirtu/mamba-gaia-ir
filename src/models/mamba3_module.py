@@ -277,7 +277,7 @@ class Mamba3LitModule(LightningModule):
             else:
                 # x is [B, seq_len] token_ids -> [B, seq_len, d_model]
                 x = self.text_embed(x)
-                out = self.text_model(x)  # [B, L, d_model]
+                out = self.text_model(x, attention_mask=attention_mask)  # [B, L, d_model]
 
                 if out.dim() == 3:
                     if attention_mask is not None:
