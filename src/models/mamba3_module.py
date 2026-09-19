@@ -2,13 +2,12 @@ import gc
 from typing import Any, Dict, Tuple  # noqa: UP035
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 import wandb
 from lightning import LightningModule
 from lightning.pytorch.loggers import WandbLogger
 from torchmetrics import MaxMetric, MeanMetric
-
-import torch
-import torch.nn.functional as F
 
 
 def multi_positive_cross_entropy(
@@ -207,7 +206,6 @@ class Mamba3LitModule(LightningModule):
         self.val_outputs = {
             "img_embs": [],
             "txt_embs": [],
-            "raw_texts": [],
             "img_ids": [],
             "txt_img_ids": [],
         }
@@ -237,7 +235,6 @@ class Mamba3LitModule(LightningModule):
         self.test_outputs = {
             "img_embs": [],
             "txt_embs": [],
-            "raw_texts": [],
             "img_ids": [],
             "txt_img_ids": [],
         }
@@ -277,7 +274,9 @@ class Mamba3LitModule(LightningModule):
             else:
                 # x is [B, seq_len] token_ids -> [B, seq_len, d_model]
                 x = self.text_embed(x)
-                out = self.text_model(x, attention_mask=attention_mask)  # [B, L, d_model]
+                out = self.text_model(
+                    x, attention_mask=attention_mask
+                )  # [B, L, d_model]
 
                 if out.dim() == 3:
                     if attention_mask is not None:
@@ -408,31 +407,16 @@ class Mamba3LitModule(LightningModule):
 
     def on_train_epoch_end(self) -> None:
         "Lightning hook that is called when a training epoch ends."
+
         train_i2t_r1 = torch.as_tensor(
-            self.train_i2t_r1.compute(),
-            device=self.device,
-            dtype=torch.float32,
+            self.train_i2t_r1.compute(), device=self.device, dtype=torch.float32
         )
-
         train_t2i_r1 = torch.as_tensor(
-            self.train_t2i_r1.compute(),
-            device=self.device,
-            dtype=torch.float32,
+            self.train_t2i_r1.compute(), device=self.device, dtype=torch.float32
         )
 
-        self.log(
-            "train/I2T_R1",
-            train_i2t_r1,
-            prog_bar=True,
-            sync_dist=True,
-        )
-
-        self.log(
-            "train/T2I_R1",
-            train_t2i_r1,
-            prog_bar=True,
-            sync_dist=True,
-        )
+        self.log("train/I2T_R1", train_i2t_r1, prog_bar=True, sync_dist=True)
+        self.log("train/T2I_R1", train_t2i_r1, prog_bar=True, sync_dist=True)
         self.train_i2t_r1.reset()
         self.train_t2i_r1.reset()
 
@@ -499,7 +483,6 @@ class Mamba3LitModule(LightningModule):
         self.val_outputs["txt_embs"].append(txt_emb_all.detach().cpu())
         self.val_outputs["img_ids"].append(image_ids.detach().cpu())
         self.val_outputs["txt_img_ids"].append(txt_img_ids.detach().cpu())
-        self.val_outputs["raw_texts"].extend(text_strings)
 
         self.val_loss.update(loss)
         self.log(
@@ -516,9 +499,7 @@ class Mamba3LitModule(LightningModule):
 
         # Safety guard
         has_local = torch.tensor(
-            [bool(self.val_outputs["img_embs"])],
-            device=self.device,
-            dtype=torch.bool,
+            [bool(self.val_outputs["img_embs"])], device=self.device, dtype=torch.bool
         )
         has_outputs = self.all_gather(has_local).flatten()
 
@@ -557,6 +538,64 @@ class Mamba3LitModule(LightningModule):
         all_img_ids = self.all_gather(local_img_ids).reshape(-1)
         all_txt_img_ids = self.all_gather(local_txt_img_ids).reshape(-1)
 
+        # Translate gathered Dataset indexes into stable GAIA identifiers.
+        val_dataset = self.trainer.datamodule.data_val
+
+        all_image_metadata = [
+            val_dataset.get_retrieval_metadata(int(dataset_idx))
+            for dataset_idx in all_img_ids.detach().cpu().tolist()
+        ]
+
+        all_sample_ids = [metadata["sample_id"] for metadata in all_image_metadata]
+        all_group_ids = [metadata["group_id"] for metadata in all_image_metadata]
+
+        if all_img.shape[0] == 0:
+            raise RuntimeError("No gathered image embeddings.")
+        if all_txt.shape[0] % all_img.shape[0] != 0:
+            raise RuntimeError(
+                "Text embedding count is not divisible by image count: "
+                f"{all_txt.shape[0]} texts vs {all_img.shape[0]} images"
+            )
+
+        captions_per_image = all_txt.shape[0] // all_img.shape[0]
+
+        all_text_ids = []
+        all_text_group_ids = []
+        all_text_valid_mask = []
+
+        for metadata in all_image_metadata:
+            text_ids = list(metadata["text_ids"])
+            num_valid = metadata["num_valid_captions"]
+
+            while len(text_ids) < captions_per_image:
+                padding_position = len(text_ids)
+                text_ids.append(f"{metadata['sample_id']}:padding:{padding_position}")
+
+            text_ids = text_ids[:captions_per_image]
+
+            all_text_ids.extend(text_ids)
+            all_text_group_ids.extend([metadata["group_id"]] * captions_per_image)
+            all_text_valid_mask.extend(
+                [
+                    caption_position < num_valid
+                    for caption_position in range(captions_per_image)
+                ]
+            )
+
+        if len(all_sample_ids) != all_img.shape[0]:
+            raise RuntimeError(
+                "Stable image ID count does not match image embeddings: "
+                f"{len(all_sample_ids)} IDs vs "
+                f"{all_img.shape[0]} embeddings"
+            )
+
+        if len(all_text_ids) != all_txt.shape[0]:
+            raise RuntimeError(
+                "Stable text ID count does not match text embeddings: "
+                f"{len(all_text_ids)} IDs vs "
+                f"{all_txt.shape[0]} embeddings"
+            )
+
         if all_img.ndim != 2 or all_txt.ndim != 2:
             raise RuntimeError(
                 f"Expected 2-D embeddings, got "
@@ -567,7 +606,13 @@ class Mamba3LitModule(LightningModule):
         all_img = torch.nn.functional.normalize(all_img, p=2, dim=-1)
         all_txt = torch.nn.functional.normalize(all_txt, p=2, dim=-1)
 
-        import torch.distributed as dist
+        image_norms = all_img.norm(dim=1)
+        text_norms = all_txt.norm(dim=1)
+
+        if not torch.allclose(image_norms, torch.ones_like(image_norms), atol=1e-4):
+            raise RuntimeError("Image embeddings are not L2-normalized.")
+        if not torch.allclose(text_norms, torch.ones_like(text_norms), atol=1e-4):
+            raise RuntimeError("Text embeddings are not L2-normalized.")
 
         local_strings = list(self.val_outputs["raw_texts"])
 
@@ -587,13 +632,6 @@ class Mamba3LitModule(LightningModule):
                 f"Expected 2-D similarity matrix, got {sim_matrix.shape}"
             )
 
-        if len(all_strings) != sim_matrix.shape[1]:
-            raise RuntimeError(
-                f"Embedding/string count mismatch: "
-                f"{sim_matrix.shape[1]} text embeddings vs "
-                f"{len(all_strings)} strings"
-            )
-
         # Multi-relevant ground truth: text j is relevant to image i iff they
         # share the same source-image id (standard 5-captions-per-image
         # protocol), not just the diagonal
@@ -610,39 +648,60 @@ class Mamba3LitModule(LightningModule):
 
         if not relevant.any(dim=1).all():
             raise RuntimeError("At least one image has no relevant caption.")
-
         if not relevant.any(dim=0).all():
             raise RuntimeError("At least one caption has no owning image.")
+
+        valid_text_mask_tensor = torch.as_tensor(
+            all_text_valid_mask, dtype=torch.bool, device=sim_matrix.device
+        )
+
+        # I2T:
+        # - every image is a query;
+        # - padded text candidates are removed.
+        i2t_scores = sim_matrix[:, valid_text_mask_tensor]
+        i2t_relevant = relevant[:, valid_text_mask_tensor]
+
+        # T2I:
+        # - every valid text is a query;
+        # - every image is a candidate.
+        t2i_scores = sim_matrix[:, valid_text_mask_tensor].t()
+        t2i_relevant = relevant[:, valid_text_mask_tensor].t()
+
+        i2t_ranking = self._compute_ranking_metrics(i2t_scores, i2t_relevant)
+        t2i_ranking = self._compute_ranking_metrics(t2i_scores, t2i_relevant)
 
         # 3. Calculate R@1, R@5, R@10 for both directions
         val_results = {}
         for k in [1, 5, 10, 20]:
-            kk = min(k, sim_matrix.shape[1])
-            # --- Image to Text (Rows): correct if ANY relevant caption is int top-k ---
-            top_k_i2t = sim_matrix.topk(kk, dim=1).indices
-            r_i2t = relevant.gather(1, top_k_i2t).any(dim=1).float().mean()
+            # Image-to-text over valid caption candidates only.
+            kk_i2t = min(k, i2t_scores.shape[1])
+            top_k_i2t = i2t_scores.topk(kk_i2t, dim=1).indices
+            r_i2t = i2t_relevant.gather(1, top_k_i2t).any(dim=1).float().mean()
             val_results[f"val/I2T_R{k}"] = r_i2t
 
-            # --- Text to Image (Columns): correct if the true image is in top-k ---
-            sim_t = sim_matrix.t()
-            kk_t = min(k, sim_t.shape[1])
-            top_k_t2i = sim_t.topk(kk_t, dim=1).indices
-            candidate_ids = all_img_ids[top_k_t2i]  # [N_txt, kk_t]
-            owning_ids = all_txt_img_ids.unsqueeze(1)  # [N_txt, 1]
-            r_t2i = (candidate_ids == owning_ids).any(dim=1).float().mean()
+            # Text-to-image over valid text queries only.
+            kk_t2i = min(k, t2i_scores.shape[1])
+            top_k_t2i = t2i_scores.topk(kk_t2i, dim=1).indices
+            r_t2i = t2i_relevant.gather(1, top_k_t2i).any(dim=1).float().mean()
             val_results[f"val/T2I_R{k}"] = r_t2i
 
         val_results["val/mean_R1"] = 0.5 * (
             val_results["val/I2T_R1"] + val_results["val/T2I_R1"]
         )
 
+        for metric_name, value in i2t_ranking.items():
+            val_results[f"val/I2T_{metric_name}"] = value
+        for metric_name, value in t2i_ranking.items():
+            val_results[f"val/T2I_{metric_name}"] = value
+
+        for metric_name in ["MRR", "mAP", "nDCG"]:
+            val_results[f"val/mean_{metric_name}"] = 0.5 * (
+                i2t_ranking[metric_name] + t2i_ranking[metric_name]
+            )
+
         # 4. Log all metrics to WandB/Progress Bar
         self.log_dict(
-            val_results,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
+            val_results, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True
         )
 
         # 5. Update "Best" trackers (Usually tracked via R1)
@@ -658,21 +717,14 @@ class Mamba3LitModule(LightningModule):
 
         # Ensure Lightning receives tensors rather than wrapper objects.
         batch_i2t_r1 = torch.as_tensor(
-            batch_i2t_r1,
-            device=self.device,
-            dtype=torch.float32,
+            batch_i2t_r1, device=self.device, dtype=torch.float32
         )
         batch_t2i_r1 = torch.as_tensor(
-            batch_t2i_r1,
-            device=self.device,
-            dtype=torch.float32,
+            batch_t2i_r1, device=self.device, dtype=torch.float32
         )
 
         self.log_dict(
-            {
-                "val/batch_I2T_R1": batch_i2t_r1,
-                "val/batch_T2I_R1": batch_t2i_r1,
-            },
+            {"val/batch_I2T_R1": batch_i2t_r1, "val/batch_T2I_R1": batch_t2i_r1},
             on_step=False,
             on_epoch=True,
             prog_bar=False,
@@ -681,12 +733,23 @@ class Mamba3LitModule(LightningModule):
 
         # 6. Save visual results table
         if self.trainer.is_global_zero:
-            self._save_results(
-                sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="val"
+            self._save_retrieval_diagnostics(
+                sim_matrix=sim_matrix,
+                img_ids=all_img_ids,
+                txt_img_ids=all_txt_img_ids,
+                sample_ids=all_sample_ids,
+                group_ids=all_group_ids,
+                text_ids=all_text_ids,
+                text_group_ids=all_text_group_ids,
+                text_valid_mask=all_text_valid_mask,
+                metadata=all_image_metadata,
+                phase="val",
+                top_k=10,
+                max_queries_per_direction=15,
             )
-            self._save_misc_metrics(
-                sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="val"
-            )
+            # self._save_misc_metrics(
+            #     sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="val"
+            # )
 
         # # Diagnostic to check DistributedSampler repeating samples
         # if self.trainer.is_global_zero:
@@ -703,7 +766,6 @@ class Mamba3LitModule(LightningModule):
         self.val_outputs = {
             "img_embs": [],
             "txt_embs": [],
-            "raw_texts": [],
             "img_ids": [],
             "txt_img_ids": [],
         }
@@ -762,15 +824,12 @@ class Mamba3LitModule(LightningModule):
         self.test_outputs["txt_embs"].append(txt_emb_all.detach().cpu())
         self.test_outputs["img_ids"].append(image_ids.detach().cpu())
         self.test_outputs["txt_img_ids"].append(txt_img_ids.detach().cpu())
-        self.test_outputs["raw_texts"].extend(text_strings)
 
     def on_test_epoch_end(self) -> None:
         """Lightning hook that is called when a test epoch ends."""
 
         has_local = torch.tensor(
-            [bool(self.test_outputs["img_embs"])],
-            device=self.device,
-            dtype=torch.bool,
+            [bool(self.test_outputs["img_embs"])], device=self.device, dtype=torch.bool
         )
         has_outputs = self.all_gather(has_local).flatten()
 
@@ -815,6 +874,64 @@ class Mamba3LitModule(LightningModule):
         all_img_ids = self.all_gather(local_img_ids).reshape(-1)
         all_txt_img_ids = self.all_gather(local_txt_img_ids).reshape(-1)
 
+        # Translate gathered Dataset indexes into stable GAIA identifiers.
+        test_dataset = self.trainer.datamodule.data_test
+
+        all_image_metadata = [
+            test_dataset.get_retrieval_metadata(int(dataset_idx))
+            for dataset_idx in all_img_ids.detach().cpu().tolist()
+        ]
+
+        all_sample_ids = [metadata["sample_id"] for metadata in all_image_metadata]
+        all_group_ids = [metadata["group_id"] for metadata in all_image_metadata]
+
+        if all_img.shape[0] == 0:
+            raise RuntimeError("No gathered image embeddings.")
+        if all_txt.shape[0] % all_img.shape[0] != 0:
+            raise RuntimeError(
+                "Text embedding count is not divisible by image count: "
+                f"{all_txt.shape[0]} texts vs {all_img.shape[0]} images"
+            )
+
+        captions_per_image = all_txt.shape[0] // all_img.shape[0]
+
+        all_text_ids = []
+        all_text_group_ids = []
+        all_text_valid_mask = []
+
+        for metadata in all_image_metadata:
+            text_ids = list(metadata["text_ids"])
+            num_valid = metadata["num_valid_captions"]
+
+            while len(text_ids) < captions_per_image:
+                padding_position = len(text_ids)
+                text_ids.append(f"{metadata['sample_id']}:padding:{padding_position}")
+
+            text_ids = text_ids[:captions_per_image]
+
+            all_text_ids.extend(text_ids)
+            all_text_group_ids.extend([metadata["group_id"]] * captions_per_image)
+            all_text_valid_mask.extend(
+                [
+                    caption_position < num_valid
+                    for caption_position in range(captions_per_image)
+                ]
+            )
+
+        if len(all_sample_ids) != all_img.shape[0]:
+            raise RuntimeError(
+                "Stable image ID count does not match image embeddings: "
+                f"{len(all_sample_ids)} IDs vs "
+                f"{all_img.shape[0]} embeddings"
+            )
+
+        if len(all_text_ids) != all_txt.shape[0]:
+            raise RuntimeError(
+                "Stable text ID count does not match text embeddings: "
+                f"{len(all_text_ids)} IDs vs "
+                f"{all_txt.shape[0]} embeddings"
+            )
+
         if all_img.ndim != 2 or all_txt.ndim != 2:
             raise RuntimeError(
                 f"Expected 2-D embeddings, got "
@@ -824,6 +941,14 @@ class Mamba3LitModule(LightningModule):
         # 2. Normalize and compute Global Similarity Matrix
         all_img = torch.nn.functional.normalize(all_img, p=2, dim=-1)
         all_txt = torch.nn.functional.normalize(all_txt, p=2, dim=-1)
+
+        image_norms = all_img.norm(dim=1)
+        text_norms = all_txt.norm(dim=1)
+
+        if not torch.allclose(image_norms, torch.ones_like(image_norms), atol=1e-4):
+            raise RuntimeError("Image embeddings are not L2-normalized.")
+        if not torch.allclose(text_norms, torch.ones_like(text_norms), atol=1e-4):
+            raise RuntimeError("Text embeddings are not L2-normalized.")
 
         import torch.distributed as dist
 
@@ -843,12 +968,6 @@ class Mamba3LitModule(LightningModule):
         if sim_matrix.ndim != 2:
             raise RuntimeError(
                 f"Expected 2-D similarity matrix, got {sim_matrix.shape}"
-            )
-
-        if len(all_strings) != sim_matrix.shape[1]:
-            raise RuntimeError(
-                f"Embedding/string count mismatch: "
-                f"{sim_matrix.shape[1]} text embeddings vs {len(all_strings)} strings"
             )
 
         # Multi-relevant ground truth: text j is relevant to image i iff they
@@ -871,51 +990,75 @@ class Mamba3LitModule(LightningModule):
         if not relevant.any(dim=0).all():
             raise RuntimeError("At least one caption has no owning image.")
 
+        valid_text_mask_tensor = torch.as_tensor(
+            all_text_valid_mask, dtype=torch.bool, device=sim_matrix.device
+        )
+
+        i2t_scores = sim_matrix[:, valid_text_mask_tensor]
+        i2t_relevant = relevant[:, valid_text_mask_tensor]
+
+        t2i_scores = sim_matrix[:, valid_text_mask_tensor].t()
+        t2i_relevant = relevant[:, valid_text_mask_tensor].t()
+
+        i2t_ranking = self._compute_ranking_metrics(i2t_scores, i2t_relevant)
+        t2i_ranking = self._compute_ranking_metrics(t2i_scores, t2i_relevant)
+
         # 3. Calculate R@1, R@5, R@10 for both directions
         test_results = {}
         for k in [1, 5, 10, 20]:
-            kk = min(k, sim_matrix.shape[1])
-            # --- Image to Text (Rows): correct if ANY relevant caption is int top-k ---
-            top_k_i2t = sim_matrix.topk(kk, dim=1).indices
-            r_i2t = relevant.gather(1, top_k_i2t).any(dim=1).float().mean()
+            kk_i2t = min(k, i2t_scores.shape[1])
+            top_k_i2t = i2t_scores.topk(kk_i2t, dim=1).indices
+            r_i2t = i2t_relevant.gather(1, top_k_i2t).any(dim=1).float().mean()
             test_results[f"test/I2T_R{k}"] = r_i2t
 
-            # --- Text to Image (Columns): correct if the true image is in top-k ---
-            sim_t = sim_matrix.t()
-            kk_t = min(k, sim_t.shape[1])
-            top_k_t2i = sim_t.topk(kk_t, dim=1).indices
-            candidate_ids = all_img_ids[top_k_t2i]  # [N_txt, kk_t]
-            owning_ids = all_txt_img_ids.unsqueeze(1)  # [N_txt, 1]
-            r_t2i = (candidate_ids == owning_ids).any(dim=1).float().mean()
+            kk_t2i = min(k, t2i_scores.shape[1])
+            top_k_t2i = t2i_scores.topk(kk_t2i, dim=1).indices
+            r_t2i = t2i_relevant.gather(1, top_k_t2i).any(dim=1).float().mean()
             test_results[f"test/T2I_R{k}"] = r_t2i
 
         test_results["test/mean_R1"] = 0.5 * (
             test_results["test/I2T_R1"] + test_results["test/T2I_R1"]
         )
 
+        for metric_name, value in i2t_ranking.items():
+            test_results[f"test/I2T_{metric_name}"] = value
+        for metric_name, value in t2i_ranking.items():
+            test_results[f"test/T2I_{metric_name}"] = value
+
+        for metric_name in ["MRR", "mAP", "nDCG"]:
+            test_results[f"test/mean_{metric_name}"] = 0.5 * (
+                i2t_ranking[metric_name] + t2i_ranking[metric_name]
+            )
+
         # 4. Log all metrics to WandB/Progress Bar
         self.log_dict(
-            test_results,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
+            test_results, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True
         )
 
         # 6. Save visual results table
         if self.trainer.is_global_zero:
-            self._save_results(
-                sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="test"
+            self._save_retrieval_diagnostics(
+                sim_matrix=sim_matrix,
+                img_ids=all_img_ids,
+                txt_img_ids=all_txt_img_ids,
+                sample_ids=all_sample_ids,
+                group_ids=all_group_ids,
+                text_ids=all_text_ids,
+                text_group_ids=all_text_group_ids,
+                text_valid_mask=all_text_valid_mask,
+                metadata=all_image_metadata,
+                phase="test",
+                top_k=10,
+                max_queries_per_direction=15,
             )
-            self._save_misc_metrics(
-                sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="test"
-            )
+            # self._save_misc_metrics(
+            #     sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="test"
+            # )
 
         # 7. Reset storage for the next epoch
         self.test_outputs = {
             "img_embs": [],
             "txt_embs": [],
-            "raw_texts": [],
             "img_ids": [],
             "txt_img_ids": [],
         }
@@ -989,44 +1132,230 @@ class Mamba3LitModule(LightningModule):
             }
         return {"optimizer": optimizer}
 
-    def _save_results(self, sim_matrix, all_texts, img_ids, txt_img_ids, phase="val"):
-        """Logs a table to WandB showing what the model predicted."""
-        if isinstance(self.logger, WandbLogger):
-            columns = [
-                "Image_Index",
-                "True_Caption",
-                "Model_Top_Pick",
-                "Confidence",
-                "Correct",
-            ]
-            table = wandb.Table(columns=columns)
+    def _save_retrieval_diagnostics(
+        self,
+        sim_matrix,
+        img_ids,
+        txt_img_ids,
+        sample_ids,
+        group_ids,
+        text_ids,
+        text_group_ids,
+        text_valid_mask,
+        metadata,
+        phase="val",
+        top_k=10,
+        max_queries_per_direction=15,
+    ):
+        """Log stable-ID retrieval diagnostics for I2T and T2I."""
 
-            # Look at the first 15 images to keep the WandB payload light
-            num_samples_to_log = min(15, sim_matrix.shape[0])
+        if not isinstance(self.logger, WandbLogger):
+            return
 
-            relevant = img_ids.unsqueeze(1) == txt_img_ids.unsqueeze(
-                0
-            )  # [N_img, N_txt]
+        num_images, num_texts = sim_matrix.shape
 
-            # Convert raw similarities to probabilities for readability
-            probs = torch.softmax(sim_matrix[:num_samples_to_log].float(), dim=1)
-            confidences, indices = probs.topk(1, dim=1)
+        # ------------------------------------------------------------------
+        # Validate alignment
+        # ------------------------------------------------------------------
+        if len(sample_ids) != num_images:
+            raise RuntimeError(
+                "sample_ids/image count mismatch: "
+                f"{len(sample_ids)} IDs vs {num_images} images"
+            )
 
-            for i in range(num_samples_to_log):
-                # Show one of the (possibly several) ground-truth captions for this image
-                gt_indices = relevant[i].nonzero(as_tuple=True)[0]
-                true_caption = (
-                    all_texts[gt_indices[0].item()] if len(gt_indices) else ""
+        if len(group_ids) != num_images:
+            raise RuntimeError(
+                "group_ids/image count mismatch: "
+                f"{len(group_ids)} IDs vs {num_images} images"
+            )
+
+        if len(metadata) != num_images:
+            raise RuntimeError(
+                "metadata/image count mismatch: "
+                f"{len(metadata)} rows vs {num_images} images"
+            )
+
+        if len(text_ids) != num_texts:
+            raise RuntimeError(
+                "text_ids/text count mismatch: "
+                f"{len(text_ids)} IDs vs {num_texts} texts"
+            )
+
+        if len(text_group_ids) != num_texts:
+            raise RuntimeError(
+                "text_group_ids/text count mismatch: "
+                f"{len(text_group_ids)} IDs vs {num_texts} texts"
+            )
+
+        if len(text_valid_mask) != num_texts:
+            raise RuntimeError(
+                "text_valid_mask/text count mismatch: "
+                f"{len(text_valid_mask)} flags vs {num_texts} texts"
+            )
+
+        valid_text_mask = torch.as_tensor(
+            text_valid_mask, dtype=torch.bool, device=sim_matrix.device
+        )
+
+        if not valid_text_mask.any():
+            raise RuntimeError(
+                "No valid text entries are available for retrieval diagnostics."
+            )
+
+        columns = [
+            "Retrieval_Direction",
+            "Query_ID",
+            "Query_Group_ID",
+            "Positive_IDs",
+            "Positive_Rank",
+            "TopK_Retrieved_IDs",
+            "TopK_Cosine_Scores",
+            "Hardest_Negative_ID",
+            "Hardest_Negative_Cosine",
+            "Top1_Correct",
+            "Location",
+        ]
+
+        table = wandb.Table(columns=columns)
+
+        # ------------------------------------------------------------------
+        # Image-to-text diagnostics
+        # ------------------------------------------------------------------
+        num_i2t_queries = min(max_queries_per_direction, num_images)
+
+        for image_position in range(num_i2t_queries):
+            scores = sim_matrix[image_position].float()
+
+            positive_mask = (txt_img_ids == img_ids[image_position]) & valid_text_mask
+
+            if not positive_mask.any():
+                raise RuntimeError(
+                    "Image query has no valid positive captions: "
+                    f"position={image_position}, "
+                    f"sample_id={sample_ids[image_position]}"
                 )
-                predicted_idx = indices[i].item()
-                predicted_caption = all_texts[predicted_idx]
-                conf = confidences[i].item()
-                is_correct = bool(relevant[i, predicted_idx].item())
 
-                table.add_data(i, true_caption, predicted_caption, conf, is_correct)
+            # Exclude padded captions from the ranking.
+            ranking_scores = scores.clone()
+            ranking_scores[~valid_text_mask] = -torch.inf
 
-            # This will show up in WandB under the "val/predictions_sample" tab
-            self.logger.experiment.log({f"{phase}/predictions_brief": table})
+            ranked_indices = torch.argsort(ranking_scores, descending=True)
+            ranked_indices = ranked_indices[valid_text_mask[ranked_indices]]
+
+            positive_positions = torch.nonzero(
+                positive_mask[ranked_indices], as_tuple=True
+            )[0]
+
+            positive_rank = int(positive_positions[0].item() + 1)
+            positive_indices = torch.nonzero(positive_mask, as_tuple=True)[0]
+            positive_ids = [text_ids[int(index.item())] for index in positive_indices]
+
+            current_top_k = min(top_k, ranked_indices.numel())
+
+            top_indices = ranked_indices[:current_top_k]
+            top_ids = [text_ids[int(index.item())] for index in top_indices]
+            top_scores = [
+                float(scores[int(index.item())].item()) for index in top_indices
+            ]
+
+            negative_ranked_indices = ranked_indices[~positive_mask[ranked_indices]]
+
+            if negative_ranked_indices.numel() > 0:
+                hardest_negative_position = int(negative_ranked_indices[0].item())
+                hardest_negative_id = text_ids[hardest_negative_position]
+                hardest_negative_score = float(scores[hardest_negative_position].item())
+            else:
+                hardest_negative_id = None
+                hardest_negative_score = None
+
+            top1_correct = bool(positive_mask[ranked_indices[0]].item())
+
+            table.add_data(
+                "I2T",
+                sample_ids[image_position],
+                group_ids[image_position],
+                positive_ids,
+                positive_rank,
+                top_ids,
+                top_scores,
+                hardest_negative_id,
+                hardest_negative_score,
+                top1_correct,
+                metadata[image_position].get("location"),
+            )
+
+        # ------------------------------------------------------------------
+        # Text-to-image diagnostics
+        # ------------------------------------------------------------------
+        valid_text_positions = torch.nonzero(valid_text_mask, as_tuple=True)[0]
+
+        num_t2i_queries = min(
+            max_queries_per_direction,
+            valid_text_positions.numel(),
+        )
+
+        for query_number in range(num_t2i_queries):
+            text_position = int(valid_text_positions[query_number].item())
+
+            scores = sim_matrix[:, text_position].float()
+
+            positive_mask = img_ids == txt_img_ids[text_position]
+
+            if not positive_mask.any():
+                raise RuntimeError(
+                    "Text query has no owning image: "
+                    f"text_position={text_position}, "
+                    f"text_id={text_ids[text_position]}"
+                )
+
+            ranked_indices = torch.argsort(scores, descending=True)
+
+            positive_positions = torch.nonzero(
+                positive_mask[ranked_indices], as_tuple=True
+            )[0]
+            positive_rank = int(positive_positions[0].item() + 1)
+            positive_indices = torch.nonzero(positive_mask, as_tuple=True)[0]
+            positive_ids = [sample_ids[int(index.item())] for index in positive_indices]
+
+            current_top_k = min(top_k, ranked_indices.numel())
+
+            top_indices = ranked_indices[:current_top_k]
+            top_ids = [sample_ids[int(index.item())] for index in top_indices]
+            top_scores = [
+                float(scores[int(index.item())].item()) for index in top_indices
+            ]
+
+            negative_ranked_indices = ranked_indices[~positive_mask[ranked_indices]]
+
+            if negative_ranked_indices.numel() > 0:
+                hardest_negative_position = int(negative_ranked_indices[0].item())
+                hardest_negative_id = sample_ids[hardest_negative_position]
+                hardest_negative_score = float(scores[hardest_negative_position].item())
+            else:
+                hardest_negative_id = None
+                hardest_negative_score = None
+
+            top1_correct = bool(positive_mask[ranked_indices[0]].item())
+
+            # Find metadata for this caption's owning image.
+            owner_positions = torch.nonzero(positive_mask, as_tuple=True)[0]
+            owner_position = int(owner_positions[0].item())
+
+            table.add_data(
+                "T2I",
+                text_ids[text_position],
+                text_group_ids[text_position],
+                positive_ids,
+                positive_rank,
+                top_ids,
+                top_scores,
+                hardest_negative_id,
+                hardest_negative_score,
+                top1_correct,
+                metadata[owner_position].get("location"),
+            )
+
+        self.logger.experiment.log({f"{phase}/retrieval_diagnostics": table})
 
     @torch.no_grad()
     def _save_misc_metrics(
@@ -1107,6 +1436,76 @@ class Mamba3LitModule(LightningModule):
             )
 
         self.logger.experiment.log({f"{phase}/predictions_detailed": table})
+
+    @staticmethod
+    def _compute_ranking_metrics(
+        scores: torch.Tensor,
+        relevant: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute binary-relevance ranking metrics for one direction."""
+
+        if scores.ndim != 2 or relevant.ndim != 2:
+            raise RuntimeError("scores and relevant must both be 2-D.")
+
+        if scores.shape != relevant.shape:
+            raise RuntimeError(
+                f"Ranking shape mismatch: "
+                f"scores={tuple(scores.shape)}, "
+                f"relevant={tuple(relevant.shape)}"
+            )
+
+        if not relevant.any(dim=1).all():
+            raise RuntimeError("At least one query has no relevant candidate.")
+
+        ranked_indices = torch.argsort(scores, dim=1, descending=True)
+        ranked_relevant = relevant.gather(1, ranked_indices)
+
+        num_queries, num_candidates = ranked_relevant.shape
+
+        ranks = (
+            torch.arange(
+                1, num_candidates + 1, device=scores.device, dtype=torch.float32
+            )
+            .unsqueeze(0)
+            .expand(num_queries, -1)
+        )
+
+        # Rank of the highest-ranked positive candidate.
+        positive_ranks = torch.where(
+            ranked_relevant, ranks, torch.full_like(ranks, float("inf"))
+        )
+
+        first_positive_rank = positive_ranks.min(dim=1).values
+
+        # Reciprocal rank.
+        reciprocal_rank = 1.0 / first_positive_rank
+
+        # Average precision.
+        cumulative_relevant = ranked_relevant.float().cumsum(dim=1)
+        precision_at_rank = cumulative_relevant / ranks
+
+        num_relevant = ranked_relevant.sum(dim=1).clamp_min(1)
+
+        average_precision = (precision_at_rank * ranked_relevant.float()).sum(
+            dim=1
+        ) / num_relevant
+
+        # Binary-relevance nDCG.
+        discounts = 1.0 / torch.log2(ranks + 1.0)
+
+        dcg = (ranked_relevant.float() * discounts).sum(dim=1)
+        ideal_relevant = (ranks <= num_relevant.unsqueeze(1)).float()
+
+        idcg = (ideal_relevant * discounts).sum(dim=1).clamp_min(1e-12)
+        ndcg = dcg / idcg
+
+        return {
+            "mean_rank": first_positive_rank.mean(),
+            "median_rank": torch.quantile(first_positive_rank.float(), 0.5),
+            "MRR": reciprocal_rank.mean(),
+            "mAP": average_precision.mean(),
+            "nDCG": ndcg.mean(),
+        }
 
 
 if __name__ == "__main__":

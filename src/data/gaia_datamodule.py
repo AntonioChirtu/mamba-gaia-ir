@@ -2,7 +2,7 @@ import glob
 import json
 import os
 import random
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional  # noqa: UP035
 
 from lightning import LightningDataModule
 from omegaconf import DictConfig
@@ -15,80 +15,13 @@ from src.data.eval_collate import eval_collate_fn
 # Standard for many base Mamba models
 Image.MAX_IMAGE_PIXELS = None
 
-import torchvision.transforms.functional as F
-
-
-SPHERE_ANCORS = {
-        'Atmosphere': ['dust_storm', 'cyclon', 'typhoon', 'hurricane', 'tornado', 'smoke_plume', 'aerosol', 'cloud',
-                       'ash', 'haze', 'meteorology', 'weather_pattern'],
-        'Hydrosphere': ['water', 'ocean', 'sea', 'river', 'lake', 'flood', 'delta', 'estuar', 'phytoplankton', 'algae',
-                        'marine', 'coast', 'reef', 'reservoir', 'currents', 'hydrology', 'tidal'],
-        'Biosphere': ['agri', 'farm', 'crop', 'forest', 'veget', 'plant', 'fire', 'burn', 'wildfire', 'ndvi', 'paddy',
-                      'tree', 'leaf', 'flora', 'harvest', 'deforest', 'ecology', 'habitat', 'irrigat', 'cultiv',
-                      'plantation', 'orchard'],
-        'Cryosphere': ['ice', 'snow', 'glacier', 'polar', 'arctic', 'freeze', 'frost', 'permafrost', 'antarct',
-                       'iceberg', 'shelf', 'meltwater'],
-        'Geosphere': ['geology', 'mining', 'volcan', 'earthq', 'soil', 'mountain', 'topography', 'urban', 'city',
-                      'plateau', 'desert', 'land_use', 'land_management', 'geography']
-    }
-
-def classify_to_sphere(image_tags):
-    tag_blob = " ".join([str(t).lower() for t in image_tags])
-
-    scores = {sphere: 0 for sphere in SPHERE_ANCORS}
-
-    for sphere, stems in SPHERE_ANCORS.items():
-        for stem in stems:
-            if stem in tag_blob:
-                scores[sphere] += 2
-
-                # --- STRATEGIC WEIGHTING ---
-    if scores['Biosphere'] > 0: scores['Biosphere'] += 5  # Maximum protection for your top interest
-    if scores['Hydrosphere'] > 0: scores['Hydrosphere'] += 2
-    if scores['Atmosphere'] > 0: scores['Atmosphere'] += 1
-
-    # Geosphere Tax: Only wins if it's the ONLY clear signal
-    if scores['Geosphere'] > 0: scores['Geosphere'] -= 2
-
-    top_sphere = max(scores, key=scores.get)
-
-    if scores[top_sphere] <= 0:
-        if any(c in tag_blob for c in ['cold', 'winter', 'degree']):
-            return 'Cryosphere'
-        return 'Geosphere'
-    return top_sphere
-
-
-class ResizeAndPad:
-    def __init__(self, target_size=(224, 224)):
-        self.target_size = target_size
-
-    def __call__(self, img):
-        w, h = img.size
-        target_w, target_h = self.target_size
-
-        # 1. Calculate the scaling factor to make the longest edge fit
-        ratio = min(target_w / w, target_h / h)
-        new_w = int(w * ratio)
-        new_h = int(h * ratio)
-
-        # 2. Resize to the new dimensions
-        img = F.resize(img, (new_h, new_w), interpolation=Image.Resampling.LANCZOS)
-
-        # 3. Calculate padding to get to exactly 224x224
-        pad_w = target_w - new_w
-        pad_h = target_h - new_h
-
-        # padding is (left, top, right, bottom)
-        padding = (pad_w // 2, pad_h // 2, pad_w - (pad_w // 2), pad_h - (pad_h // 2))
-
-        return F.pad(img, padding, fill=0, padding_mode='constant')
-
 
 class GAIADataset(Dataset):
     """Custom Dataset for GAIA Information Retrieval.
     
-    Each record is ``(image_path, captions)`` where ``captions`` is the list of
+    Each record is a dictionary containing the image path, captions,
+    stable image/group IDs, stable text IDs, and source metadata,
+    where ``captions`` is the list of
     synthetic captions GAIA provides per image. During training, a caption is
     sampled at random each epoch (free text-side augmentation). During
     validation/testing all ``max_captions`` captions are returned so recall
@@ -99,7 +32,7 @@ class GAIADataset(Dataset):
 
     def __init__(
         self,
-        records: List[Tuple[str, List[str]]],
+        records: List[dict[str, Any]],
         tokenizer: Any, 
         transform: Optional[Any] = None, 
         max_length: int = 128,
@@ -123,12 +56,35 @@ class GAIADataset(Dataset):
     def _pick_caption(self, captions: List[str]) -> str:
         if not captions:
             return ""
+
         if self.is_training:
             return random.choice(captions)
+
         return captions[0]
 
+    def get_retrieval_metadata(self, idx: int) -> dict[str, Any]:
+        record = self.records[idx]
+
+        num_valid_captions = min(
+            len(record["captions"]),
+            self.max_captions,
+        )
+
+        return {
+            "dataset_index": idx,
+            "sample_id": record["sample_id"],
+            "group_id": record["group_id"],
+            "text_ids": record["text_ids"][:num_valid_captions],
+            "num_valid_captions": num_valid_captions,
+            "location": record.get("location"),
+            "image_alt": record.get("image_alt"),
+        }
+
     def __getitem__(self, idx):
-        img_path, captions = self.records[idx]
+        record = self.records[idx]
+
+        img_path = record["image_path"]
+        captions = record["captions"]
 
         try:
             with Image.open(img_path) as img:
@@ -233,15 +189,21 @@ class GAIADataModule(LightningDataModule):
     # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #
-    def _scan_split(self, split: str) -> List[Tuple[str, List[str]]]:
-        """Walk data_dir/<split>/<shard>/*.png -> [(full_path, caption)]."""
+    def _scan_split(self, split: str) -> List[dict[str, Any]]:
+        """Scan a split and return one metadata dictionary per image."""
         splits_dir = os.path.join(self.hparams.data_dir, split)
         if not os.path.isdir(splits_dir):
             raise FileNotFoundError(f"Split directory {splits_dir} does not exist.")
 
-        records: List[Tuple[str, List[str]]] = []
+        records: List[dict[str, Any]] = []
+        seen_sample_ids: set[str] = set()
+
         n_failed, n_off_sphere = 0, 0
-        for img_path in sorted(glob.glob(os.path.join(splits_dir, "*", "*.png"))):
+        n_missing_id = 0
+
+        pattern = os.path.join(splits_dir, "*", "*.png")
+
+        for img_path in sorted(glob.glob(pattern)):
             json_path = os.path.splitext(img_path)[0] + ".json"
             if not os.path.isfile(json_path):
                 continue
@@ -256,18 +218,72 @@ class GAIADataModule(LightningDataModule):
             if not captions:
                 continue
 
-            if self.hparams.spheres:
-                sphere = classify_to_sphere(meta.get("tag") or [])
-                if sphere not in self.hparams.spheres:
-                    n_off_sphere += 1
-                    continue
+            # Ensure the expected representation.
+            if not isinstance(captions, list):
+                raise TypeError(
+                    f"'captions' must be a list in {json_path}, "
+                    f"got {type(captions).__name__}"
+                )
+
+            # Remove empty captions while preserving original caption indexes.
+            indexed_captions = [
+                (caption_index, caption)
+                for caption_index, caption in enumerate(captions)
+                if isinstance(caption, str) and caption.strip()
+            ]
+
+            if not indexed_captions:
+                continue
             
-            records.append((img_path, captions))
+            source_image_id = meta.get("id")
+
+            if source_image_id is None:
+                n_missing_id += 1
+                continue
+
+            source_image_id = str(source_image_id)
+            sample_id = f"gaia:image:{source_image_id}"
+
+            if sample_id in seen_sample_ids:
+                raise ValueError(
+                    f"Duplicate GAIA image ID {source_image_id!r} "
+                    f"found while scanning {split}. File: {json_path}"
+                )
+
+            seen_sample_ids.add(sample_id)
+
+            # Captions and text_ids remain positionally aligned.
+            clean_captions = [
+                caption
+                for _, caption in indexed_captions
+            ]
+
+            text_ids = [
+                f"gaia:caption:{source_image_id}:{source_caption_index}"
+                for source_caption_index, _ in indexed_captions
+            ]
+
+            records.append(
+                {
+                    "image_path": img_path,
+                    "captions": clean_captions,
+                    "text_ids": text_ids,
+                    "sample_id": sample_id,
+                    "group_id": sample_id,
+                    "image_alt": meta.get("image_alt"),
+                    "location": meta.get("location"),
+                }
+            )
 
         if n_failed:
             print(f"GAIA {split}: skipped {n_failed} non-success downloads.")
         if n_off_sphere:
             print(f"GAIA {split}: skipped {n_off_sphere} images outside spheres={self.hparams.spheres}.")
+        if n_missing_id:
+            print(
+                f"GAIA {split}: skipped {n_missing_id} images "
+                "without a stable id."
+            )
         return records
                     
 
