@@ -6,14 +6,14 @@ from torch import nn
 
 from src.models.components.mamba_ssm_local.models.mixer_seq_simple import _init_weights
 from src.models.components.mamba_ssm_local.modules.block import Block
-from src.models.components.mamba_ssm_local.modules.mamba3_layer import Mamba3Layer
+from src.models.components.mamba_ssm_local.modules.mamba3 import Mamba3
 from src.models.components.mamba_ssm_local.modules.mixer_stack import run_mixer_layers
 
 # layer name -> (mixer class, does the layer accept `dropout` itself?)
-# Mamba3Layer takes dropout internally; Mamba2 doesn't, so it needs stack-level dropout.
+# Mamba3 takes dropout internally; Mamba2 doesn't, so it needs stack-level dropout.
 _LAYER_TYPES = {
     "Mamba2": (Mamba2, False),
-    "Mamba3": (Mamba3Layer, True),
+    "Mamba3": (Mamba3, True),
 }
 
 class MambaStack(nn.Module):
