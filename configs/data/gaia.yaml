@@ -1,5 +1,5 @@
 _target_: src.data.gaia_datamodule.GAIADataModule
-data_dir: ${paths.data_dir}
+data_dir: ${paths.data_dir}/GAIA_renewed/data
 # Expects data_dir/{train,val/test}/<shared>/<sample>.{png,json,txt}
 # Set to a list (e.g., [Bioshphere, Hydrosphere, Atmosphere]) to restrict training to a
 # sphere subset, based on `tag`; null trains on all of GAIA

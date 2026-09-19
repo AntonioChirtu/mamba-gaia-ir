@@ -237,7 +237,7 @@ class GAIADataModule(LightningDataModule):
         """Walk data_dir/<split>/<shard>/*.png -> [(full_path, caption)]."""
         splits_dir = os.path.join(self.hparams.data_dir, split)
         if not os.path.isdir(splits_dir):
-            raise FileNotFoundError(f"Split directory {root} does not exist.")
+            raise FileNotFoundError(f"Split directory {splits_dir} does not exist.")
 
         records: List[Tuple[str, List[str]]] = []
         n_failed, n_off_sphere = 0, 0
