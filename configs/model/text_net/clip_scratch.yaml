@@ -1,0 +1,7 @@
+_target_: src.models.components.text_encoders.BidirectionalTransformerTextEncoder
+d_model: 768
+n_layers: 1
+nhead: 8
+dim_feedforward: 768
+dropout: 0.2
+max_len: ${data.max_length}

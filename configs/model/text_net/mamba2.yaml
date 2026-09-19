@@ -1,8 +1,9 @@
-_target_: src.models.components.mamba_ssm_local.modules.mamba2.Mamba2
+_target_: src.models.components.mamba_ssm_local.modules.mamba2_wrapper.Mamba2TextEncoder
+
 d_model: 768
-d_state: 32
+n_layers: 1
+d_state: 64
 d_conv: 4
 expand: 2
 headdim: 16
-n_layers: 1
 dropout: 0.2

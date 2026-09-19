@@ -15,6 +15,8 @@ seed: 12345
 model:
   image_net:
     d_model: 512
+  text_net:
+    n_layers: 4
   optimizer:
     lr: 0.00015
 
@@ -33,12 +35,12 @@ hydra:
 
   sweeper:
     _target_: hydra_plugins.hydra_optuna_sweeper.optuna_sweeper.OptunaSweeper
-    storage: sqlite:///text_ablation_2_mamba.db
-    study_name: text_ablation_encoder_2_mamba
+    storage: sqlite:///text_ablation_depth.db
+    study_name: text_ablation_depth
     n_jobs: 1
     direction: maximize
     n_trials: 2  # #text encoders
 
     # ONLY the swept dimension lives here: which text_net config group to use.
     params:
-      model/text_net: choice(mamba2, clip_scratch)
+      model/text_net: choice(mamba3, clip_scratch)
