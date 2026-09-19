@@ -199,6 +199,24 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     
     callbacks.append(GPUTemperatureGuard(max_temp=85, check_interval=10))
 
+    # from hydra.core.hydra_config import HydraConfig, OmegaConf
+    # from omegaconf import open_dict
+
+    # hydra_cfg = HydraConfig.get()
+    # job_index = OmegaConf.select(hydra_cfg, "job.num", default=0)
+    # job_number = int(job_index) + 1
+
+    # image_d_model = cfg.model.image_net.d_model
+    # text_d_model = cfg.model.text_net.d_model
+
+    # run_name = (
+    #     f"RSITMD Arch Width #{job_number:02d} — "
+    #     f"I{image_d_model}-T{text_d_model}"
+    # )
+
+    # with open_dict(cfg):
+    #     cfg.logger.wandb.name = run_name
+
     log.info("Instantiating loggers...")
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
 
@@ -233,7 +251,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if ckpt_path == "":
             log.warning("Best ckpt not found! Using current weights for testing...")
             ckpt_path = None
-        # trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False)
+        trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False)
         log.info(f"Best ckpt path: {ckpt_path}")
 
     test_metrics = trainer.callback_metrics

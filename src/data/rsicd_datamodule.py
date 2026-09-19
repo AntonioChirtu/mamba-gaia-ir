@@ -35,7 +35,7 @@ class RSICDDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.max_captions = max_captions
-        self.is_eval = split in ("val", "test", "combined_val")
+        self.is_eval = split in ("val", "test")
         self.records: List[Tuple[str, List[str]]] = []
 
         if not os.path.exists(root_dir):
@@ -53,17 +53,15 @@ class RSICDDataset(Dataset):
         if split not in ("train", "val", "test"):
             raise ValueError(f"Unknown split type: {split}")
 
-        wanted_splits = split
-
         for item in images_list:
-            if item.get("split") not in wanted_splits:
+            if item.get("split") != split:
                 continue
 
             filename = item.get("filename")
             if not filename:
                 continue
 
-            full_img_path = os.path.join(root_dir, "images", filename)
+            full_img_path = os.path.join(root_dir, "rsicd_images", filename)
 
             if os.path.exists(full_img_path):
                 captions = [
