@@ -1,0 +1,9 @@
+_target_: src.models.components.mamba_ssm_local.modules.mamba_stack.MambaStack
+d_model: 768
+n_layers: 1
+d_state: 64
+d_conv: 4
+expand: 2
+headdim: 16
+dropout: 0.2
+apply_init_weights: false

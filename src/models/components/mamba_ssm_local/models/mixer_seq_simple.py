@@ -1,24 +1,24 @@
 # Copyright (c) 2023, Albert Gu, Tri Dao.
 
-import math
-from functools import partial
-import json
-import os
 import copy
-
+import json
+import math
+import os
 from collections import namedtuple
+from functools import partial
 
 import torch
 import torch.nn as nn
-
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.modules.mamba_simple import Mamba
+from mamba_ssm.modules.block import Block
 from mamba_ssm.modules.mamba2 import Mamba2
+from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mha import MHA
 from mamba_ssm.modules.mlp import GatedMLP
-from mamba_ssm.modules.block import Block
 from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
+
+from src.models.components.mamba_ssm_local.modules.mamba3 import Mamba3
 
 try:
     from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
@@ -51,10 +51,11 @@ def create_block(
         # Create a copy of the config to modify
         ssm_cfg = copy.deepcopy(ssm_cfg) if ssm_cfg is not None else {}
         ssm_layer = ssm_cfg.pop("layer", "Mamba1")
-        if ssm_layer not in ["Mamba1", "Mamba2"]:
+        ssm_layer_map = {"Mamba1": Mamba, "Mamba2": Mamba2, "Mamba3": Mamba3}
+        if ssm_layer not in ssm_layer_map:
             raise ValueError(f"Invalid ssm_layer: {ssm_layer}, only support Mamba1 and Mamba2")
         mixer_cls = partial(
-            Mamba2 if ssm_layer == "Mamba2" else Mamba,
+            ssm_layer_map[ssm_layer],
             layer_idx=layer_idx,
             **ssm_cfg,
             **factory_kwargs
