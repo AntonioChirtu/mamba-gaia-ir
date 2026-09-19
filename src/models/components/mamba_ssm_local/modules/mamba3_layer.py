@@ -138,7 +138,7 @@ class Mamba3Layer(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False, **factory_kwargs)
 
-    def forward(self, u, seq_idx=None, cu_seqlens=None, inference_params=None):
+    def forward(self, u, seq_idx=None, cu_seqlens=None, inference_params=None, **kwargs):
         """
         u: (batch, seqlen, hidden_dim)
         Returns: same shape as u
