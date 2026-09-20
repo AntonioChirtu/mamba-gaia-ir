@@ -75,9 +75,10 @@ class GAIADataset(Dataset):
             "sample_id": record["sample_id"],
             "group_id": record["group_id"],
             "text_ids": record["text_ids"][:num_valid_captions],
+            "captions": list(record["captions"][:num_valid_captions]),
             "num_valid_captions": num_valid_captions,
-            "location": record.get("location"),
             "image_alt": record.get("image_alt"),
+            "image_path": record["image_path"],
         }
 
     def __getitem__(self, idx):

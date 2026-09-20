@@ -538,6 +538,64 @@ class Mamba3LitModule(LightningModule):
         all_img_ids = self.all_gather(local_img_ids).reshape(-1)
         all_txt_img_ids = self.all_gather(local_txt_img_ids).reshape(-1)
 
+        if all_img.shape[0] == 0:
+            raise RuntimeError("No gathered image embeddings.")
+        if all_txt.shape[0] % all_img.shape[0] != 0:
+            raise RuntimeError(
+                "Text embedding count is not divisible by image count: "
+                f"{all_txt.shape[0]} texts vs {all_img.shape[0]} images"
+            )
+
+        captions_per_image = all_txt.shape[0] // all_img.shape[0]
+
+        # Validate that each text block belongs to the corresponding image.
+        for image_position in range(all_img.shape[0]):
+            start = image_position * captions_per_image
+            stop = start + captions_per_image
+
+            block_parent_ids = all_txt_img_ids[start:stop]
+            expected_parent_id = all_img_ids[image_position]
+
+            if not torch.all(block_parent_ids == expected_parent_id):
+                raise RuntimeError(
+                    "Image/text gathering order is misaligned at image position "
+                    f"{image_position}: image_id={int(expected_parent_id)}, "
+                    f"text_parent_ids={block_parent_ids.detach().cpu().tolist()}"
+                )
+
+        # DistributedSampler can repeat examples to make every rank equally sized.
+        # Keep the first complete image-caption block for each dataset index.
+        seen_image_ids = set()
+        keep_image_positions = []
+
+        for position, dataset_idx in enumerate(all_img_ids.detach().cpu().tolist()):
+            dataset_idx = int(dataset_idx)
+
+            if dataset_idx not in seen_image_ids:
+                seen_image_ids.add(dataset_idx)
+                keep_image_positions.append(position)
+
+        if len(keep_image_positions) != all_img.shape[0]:
+            print("Duplicated captions by DistributedSampler detected!")
+            keep_image_tensor = torch.tensor(
+                keep_image_positions, dtype=torch.long, device=all_img.device
+            )
+
+            keep_text_positions = [
+                image_position * captions_per_image + caption_position
+                for image_position in keep_image_positions
+                for caption_position in range(captions_per_image)
+            ]
+            keep_text_tensor = torch.tensor(
+                keep_text_positions, dtype=torch.long, device=all_txt.device
+            )
+
+            all_img = all_img.index_select(0, keep_image_tensor)
+            all_img_ids = all_img_ids.index_select(0, keep_image_tensor)
+
+            all_txt = all_txt.index_select(0, keep_text_tensor)
+            all_txt_img_ids = all_txt_img_ids.index_select(0, keep_text_tensor)
+
         # Translate gathered Dataset indexes into stable GAIA identifiers.
         val_dataset = self.trainer.datamodule.data_val
 
@@ -548,16 +606,6 @@ class Mamba3LitModule(LightningModule):
 
         all_sample_ids = [metadata["sample_id"] for metadata in all_image_metadata]
         all_group_ids = [metadata["group_id"] for metadata in all_image_metadata]
-
-        if all_img.shape[0] == 0:
-            raise RuntimeError("No gathered image embeddings.")
-        if all_txt.shape[0] % all_img.shape[0] != 0:
-            raise RuntimeError(
-                "Text embedding count is not divisible by image count: "
-                f"{all_txt.shape[0]} texts vs {all_img.shape[0]} images"
-            )
-
-        captions_per_image = all_txt.shape[0] // all_img.shape[0]
 
         all_text_ids = []
         all_text_group_ids = []
@@ -683,23 +731,53 @@ class Mamba3LitModule(LightningModule):
         for metric_name, value in t2i_ranking.items():
             val_results[f"val/T2I_{metric_name}"] = value
 
-        for metric_name in ["MRR", "mAP", "nDCG"]:
+        # MRR has the same first-positive interpretation in both directions.
+        # nDCG is normalized for the number of relevant candidates.
+        #
+        # Do not average mAP across directions:
+        # - I2T AP evaluates all relevant captions;
+        # - T2I AP equals reciprocal rank when each caption has one image.
+        for metric_name in ["MRR", "nDCG"]:
             val_results[f"val/mean_{metric_name}"] = 0.5 * (
                 i2t_ranking[metric_name] + t2i_ranking[metric_name]
             )
 
+        val_results["val/global_num_images"] = torch.tensor(
+            all_img.shape[0], device=self.device, dtype=torch.float32
+        )
+        val_results["val/global_num_texts"] = valid_text_mask_tensor.sum().float()
+
         # 4. Log all metrics to WandB/Progress Bar
         self.log_dict(
-            val_results, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True
+            val_results, on_step=False, on_epoch=True, prog_bar=True, sync_dist=False
         )
 
         # 5. Update "Best" trackers (Usually tracked via R1)
-        self.val_i2t_r1_best(val_results["val/I2T_R1"])
-        self.val_t2i_r1_best(val_results["val/T2I_R1"])
-        self.val_mean_r1_best(val_results["val/mean_R1"])
-        self.log("val/I2T_R1_best", self.val_i2t_r1_best.compute(), sync_dist=True)
-        self.log("val/T2I_R1_best", self.val_t2i_r1_best.compute(), sync_dist=True)
-        self.log("val/mean_R1_best", self.val_mean_r1_best.compute(), sync_dist=True)
+        is_new_best = False
+
+        if not self.trainer.sanity_checking:
+            current_i2t = val_results["val/I2T_R1"].detach()
+            current_t2i = val_results["val/T2I_R1"].detach()
+            current_mean = val_results["val/mean_R1"].detach()
+
+            self.val_i2t_r1_best(current_i2t)
+            self.val_t2i_r1_best(current_t2i)
+            self.val_mean_r1_best(current_mean)
+
+            best_i2t = self.val_i2t_r1_best.compute()
+            best_t2i = self.val_t2i_r1_best.compute()
+            best_mean = self.val_mean_r1_best.compute()
+
+            self.log("val/I2T_R1_best", best_i2t, sync_dist=False)
+            self.log("val/T2I_R1_best", best_t2i, sync_dist=False)
+            self.log("val/mean_R1_best", best_mean, sync_dist=False)
+
+            # True for a new best or an exact tie with the best.
+            is_new_best = bool(
+                torch.isclose(
+                    current_mean.float(), best_mean.float(), rtol=0.0, atol=1e-12
+                ).item()
+            )
 
         batch_i2t_r1 = self.val_batch_i2t_r1.compute()
         batch_t2i_r1 = self.val_batch_t2i_r1.compute()
@@ -721,7 +799,11 @@ class Mamba3LitModule(LightningModule):
         )
 
         # 6. Save visual results table
-        if self.trainer.is_global_zero:
+        if (
+            self.trainer.is_global_zero
+            and not self.trainer.sanity_checking
+            and is_new_best
+        ):
             self._save_retrieval_diagnostics(
                 sim_matrix=sim_matrix,
                 img_ids=all_img_ids,
@@ -863,6 +945,64 @@ class Mamba3LitModule(LightningModule):
         all_img_ids = self.all_gather(local_img_ids).reshape(-1)
         all_txt_img_ids = self.all_gather(local_txt_img_ids).reshape(-1)
 
+        if all_img.shape[0] == 0:
+            raise RuntimeError("No gathered image embeddings.")
+        if all_txt.shape[0] % all_img.shape[0] != 0:
+            raise RuntimeError(
+                "Text embedding count is not divisible by image count: "
+                f"{all_txt.shape[0]} texts vs {all_img.shape[0]} images"
+            )
+
+        captions_per_image = all_txt.shape[0] // all_img.shape[0]
+
+        # Validate that each text block belongs to the corresponding image.
+        for image_position in range(all_img.shape[0]):
+            start = image_position * captions_per_image
+            stop = start + captions_per_image
+
+            block_parent_ids = all_txt_img_ids[start:stop]
+            expected_parent_id = all_img_ids[image_position]
+
+            if not torch.all(block_parent_ids == expected_parent_id):
+                raise RuntimeError(
+                    "Image/text gathering order is misaligned at image position "
+                    f"{image_position}: image_id={int(expected_parent_id)}, "
+                    f"text_parent_ids={block_parent_ids.detach().cpu().tolist()}"
+                )
+
+        # DistributedSampler can repeat examples to make every rank equally sized.
+        # Keep the first complete image-caption block for each dataset index.
+        seen_image_ids = set()
+        keep_image_positions = []
+
+        for position, dataset_idx in enumerate(all_img_ids.detach().cpu().tolist()):
+            dataset_idx = int(dataset_idx)
+
+            if dataset_idx not in seen_image_ids:
+                seen_image_ids.add(dataset_idx)
+                keep_image_positions.append(position)
+
+        if len(keep_image_positions) != all_img.shape[0]:
+            print("Duplicated captions by DistributedSampler detected!")
+            keep_image_tensor = torch.tensor(
+                keep_image_positions, dtype=torch.long, device=all_img.device
+            )
+
+            keep_text_positions = [
+                image_position * captions_per_image + caption_position
+                for image_position in keep_image_positions
+                for caption_position in range(captions_per_image)
+            ]
+            keep_text_tensor = torch.tensor(
+                keep_text_positions, dtype=torch.long, device=all_txt.device
+            )
+
+            all_img = all_img.index_select(0, keep_image_tensor)
+            all_img_ids = all_img_ids.index_select(0, keep_image_tensor)
+
+            all_txt = all_txt.index_select(0, keep_text_tensor)
+            all_txt_img_ids = all_txt_img_ids.index_select(0, keep_text_tensor)
+
         # Translate gathered Dataset indexes into stable GAIA identifiers.
         test_dataset = self.trainer.datamodule.data_test
 
@@ -939,7 +1079,6 @@ class Mamba3LitModule(LightningModule):
         if not torch.allclose(text_norms, torch.ones_like(text_norms), atol=1e-4):
             raise RuntimeError("Text embeddings are not L2-normalized.")
 
-
         sim_matrix = all_img @ all_txt.t()
 
         if sim_matrix.ndim != 2:
@@ -1002,18 +1141,59 @@ class Mamba3LitModule(LightningModule):
         for metric_name, value in t2i_ranking.items():
             test_results[f"test/T2I_{metric_name}"] = value
 
-        for metric_name in ["MRR", "mAP", "nDCG"]:
-            test_results[f"test/mean_{metric_name}"] = 0.5 * (
+        # MRR has the same first-positive interpretation in both directions.
+        # nDCG is normalized for the number of relevant candidates.
+        #
+        # Do not average mAP across directions:
+        # - I2T AP evaluates all relevant captions;
+        # - T2I AP equals reciprocal rank when each caption has one image.
+        for metric_name in ["MRR", "nDCG"]:
+            test_results[f"val/mean_{metric_name}"] = 0.5 * (
                 i2t_ranking[metric_name] + t2i_ranking[metric_name]
             )
 
+        test_results["val/global_num_images"] = torch.tensor(
+            all_img.shape[0], device=self.device, dtype=torch.float32
+        )
+        test_results["val/global_num_texts"] = valid_text_mask_tensor.sum().float()
+
         # 4. Log all metrics to WandB/Progress Bar
         self.log_dict(
-            test_results, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True
+            test_results, on_step=False, on_epoch=True, prog_bar=True, sync_dist=False
         )
 
+        # 5. Update "Best" trackers (Usually tracked via R1)
+        is_new_best = False
+
+        if not self.trainer.sanity_checking:
+            current_i2t = test_results["val/I2T_R1"].detach()
+            current_t2i = test_results["val/T2I_R1"].detach()
+            current_mean = test_results["val/mean_R1"].detach()
+
+            self.val_i2t_r1_best(current_i2t)
+            self.val_t2i_r1_best(current_t2i)
+            self.val_mean_r1_best(current_mean)
+
+            best_i2t = self.val_i2t_r1_best.compute()
+            best_t2i = self.val_t2i_r1_best.compute()
+            best_mean = self.val_mean_r1_best.compute()
+
+            self.log("val/I2T_R1_best", best_i2t, sync_dist=False)
+            self.log("val/T2I_R1_best", best_t2i, sync_dist=False)
+            self.log("val/mean_R1_best", best_mean, sync_dist=False)
+
+            # True for a new best or an exact tie with the best.
+            is_new_best = bool(
+                torch.isclose(
+                    current_mean.float(), best_mean.float(), rtol=0.0, atol=1e-12
+                ).item()
+            )
         # 6. Save visual results table
-        if self.trainer.is_global_zero:
+        if (
+            self.trainer.is_global_zero
+            and not self.trainer.sanity_checking
+            and is_new_best
+        ):
             self._save_retrieval_diagnostics(
                 sim_matrix=sim_matrix,
                 img_ids=all_img_ids,
@@ -1189,8 +1369,7 @@ class Mamba3LitModule(LightningModule):
             "TopK_Cosine_Scores",
             "Hardest_Negative_ID",
             "Hardest_Negative_Cosine",
-            "Top1_Correct",
-            "Location",
+            "Top1_Correct"
         ]
 
         table = wandb.Table(columns=columns)
@@ -1257,8 +1436,7 @@ class Mamba3LitModule(LightningModule):
                 top_scores,
                 hardest_negative_id,
                 hardest_negative_score,
-                top1_correct,
-                metadata[image_position].get("location"),
+                top1_correct
             )
 
         # ------------------------------------------------------------------
@@ -1328,8 +1506,7 @@ class Mamba3LitModule(LightningModule):
                 top_scores,
                 hardest_negative_id,
                 hardest_negative_score,
-                top1_correct,
-                metadata[owner_position].get("location"),
+                top1_correct
             )
 
         self.logger.experiment.log({f"{phase}/retrieval_diagnostics": table})
@@ -1431,6 +1608,16 @@ class Mamba3LitModule(LightningModule):
                 f"relevant={tuple(relevant.shape)}"
             )
 
+        relevant = relevant.bool()
+
+        if not torch.isfinite(scores).all():
+            num_non_finite = (~torch.isfinite(scores)).sum()
+
+            raise RuntimeError(
+                "Ranking scores contain non-finite values: "
+                f"{int(num_non_finite.item())}"
+            )
+
         if not relevant.any(dim=1).all():
             raise RuntimeError("At least one query has no relevant candidate.")
 
@@ -1478,7 +1665,10 @@ class Mamba3LitModule(LightningModule):
 
         return {
             "mean_rank": first_positive_rank.mean(),
-            "median_rank": torch.quantile(first_positive_rank.float(), 0.5),
+            "median_rank": torch.quantile(first_positive_rank.float(), 0.50),
+            "rank_p90": torch.quantile(first_positive_rank.float(), 0.90),
+            "rank_p95": torch.quantile(first_positive_rank.float(), 0.95),
+            "max_rank": first_positive_rank.max(),
             "MRR": reciprocal_rank.mean(),
             "mAP": average_precision.mean(),
             "nDCG": ndcg.mean(),
