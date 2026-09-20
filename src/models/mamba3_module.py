@@ -614,17 +614,6 @@ class Mamba3LitModule(LightningModule):
         if not torch.allclose(text_norms, torch.ones_like(text_norms), atol=1e-4):
             raise RuntimeError("Text embeddings are not L2-normalized.")
 
-        local_strings = list(self.val_outputs["raw_texts"])
-
-        if dist.is_available() and dist.is_initialized():
-            gathered_strings = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered_strings, local_strings)
-            all_strings = [
-                text for rank_strings in gathered_strings for text in rank_strings
-            ]
-        else:
-            all_strings = local_strings
-
         sim_matrix = all_img @ all_txt.t()
 
         if sim_matrix.ndim != 2:
@@ -950,18 +939,6 @@ class Mamba3LitModule(LightningModule):
         if not torch.allclose(text_norms, torch.ones_like(text_norms), atol=1e-4):
             raise RuntimeError("Text embeddings are not L2-normalized.")
 
-        import torch.distributed as dist
-
-        local_strings = list(self.test_outputs["raw_texts"])
-
-        if dist.is_available() and dist.is_initialized():
-            gathered_strings = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered_strings, local_strings)
-            all_strings = [
-                text for rank_strings in gathered_strings for text in rank_strings
-            ]
-        else:
-            all_strings = local_strings
 
         sim_matrix = all_img @ all_txt.t()
 
@@ -1207,7 +1184,7 @@ class Mamba3LitModule(LightningModule):
             "Query_ID",
             "Query_Group_ID",
             "Positive_IDs",
-            "Positive_Rank",
+            "First_Positive_Rank",
             "TopK_Retrieved_IDs",
             "TopK_Cosine_Scores",
             "Hardest_Negative_ID",

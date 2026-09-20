@@ -199,7 +199,7 @@ class GAIADataModule(LightningDataModule):
         seen_sample_ids: set[str] = set()
 
         n_failed, n_off_sphere = 0, 0
-        n_missing_id = 0
+        n_missing_id, n_duplicate_id = 0, 0
 
         pattern = os.path.join(splits_dir, "*", "*.png")
 
@@ -239,16 +239,16 @@ class GAIADataModule(LightningDataModule):
 
             if source_image_id is None:
                 n_missing_id += 1
+                print(f"Duplicate GAIA image ID {source_image_id!r} "
+                    f"found while scanning {split}. File: {json_path}")
                 continue
 
             source_image_id = str(source_image_id)
             sample_id = f"gaia:image:{source_image_id}"
 
             if sample_id in seen_sample_ids:
-                raise ValueError(
-                    f"Duplicate GAIA image ID {source_image_id!r} "
-                    f"found while scanning {split}. File: {json_path}"
-                )
+                n_duplicate_id += 1
+                continue
 
             seen_sample_ids.add(sample_id)
 
@@ -284,6 +284,8 @@ class GAIADataModule(LightningDataModule):
                 f"GAIA {split}: skipped {n_missing_id} images "
                 "without a stable id."
             )
+        if n_duplicate_id:
+            print(f"GAIA {split}: skipped {n_duplicate_id} images with a duplicate id.")
         return records
                     
 
