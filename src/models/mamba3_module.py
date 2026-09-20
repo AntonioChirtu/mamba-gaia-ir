@@ -1148,14 +1148,14 @@ class Mamba3LitModule(LightningModule):
         # - I2T AP evaluates all relevant captions;
         # - T2I AP equals reciprocal rank when each caption has one image.
         for metric_name in ["MRR", "nDCG"]:
-            test_results[f"val/mean_{metric_name}"] = 0.5 * (
+            test_results[f"test/mean_{metric_name}"] = 0.5 * (
                 i2t_ranking[metric_name] + t2i_ranking[metric_name]
             )
 
-        test_results["val/global_num_images"] = torch.tensor(
+        test_results["test/global_num_images"] = torch.tensor(
             all_img.shape[0], device=self.device, dtype=torch.float32
         )
-        test_results["val/global_num_texts"] = valid_text_mask_tensor.sum().float()
+        test_results["test/global_num_texts"] = valid_text_mask_tensor.sum().float()
 
         # 4. Log all metrics to WandB/Progress Bar
         self.log_dict(
@@ -1166,21 +1166,21 @@ class Mamba3LitModule(LightningModule):
         is_new_best = False
 
         if not self.trainer.sanity_checking:
-            current_i2t = test_results["val/I2T_R1"].detach()
-            current_t2i = test_results["val/T2I_R1"].detach()
-            current_mean = test_results["val/mean_R1"].detach()
+            current_i2t = test_results["test/I2T_R1"].detach()
+            current_t2i = test_results["test/T2I_R1"].detach()
+            current_mean = test_results["test/mean_R1"].detach()
 
-            self.val_i2t_r1_best(current_i2t)
-            self.val_t2i_r1_best(current_t2i)
-            self.val_mean_r1_best(current_mean)
+            self.test_i2t_r1_best(current_i2t)
+            self.test_t2i_r1_best(current_t2i)
+            self.test_mean_r1_best(current_mean)
 
-            best_i2t = self.val_i2t_r1_best.compute()
-            best_t2i = self.val_t2i_r1_best.compute()
-            best_mean = self.val_mean_r1_best.compute()
+            best_i2t = self.test_i2t_r1_best.compute()
+            best_t2i = self.test_t2i_r1_best.compute()
+            best_mean = self.test_mean_r1_best.compute()
 
-            self.log("val/I2T_R1_best", best_i2t, sync_dist=False)
-            self.log("val/T2I_R1_best", best_t2i, sync_dist=False)
-            self.log("val/mean_R1_best", best_mean, sync_dist=False)
+            self.log("test/I2T_R1_best", best_i2t, sync_dist=False)
+            self.log("test/T2I_R1_best", best_t2i, sync_dist=False)
+            self.log("test/mean_R1_best", best_mean, sync_dist=False)
 
             # True for a new best or an exact tie with the best.
             is_new_best = bool(
