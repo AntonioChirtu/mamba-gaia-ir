@@ -469,6 +469,63 @@ class Mamba3LitModule(LightningModule):
             sync_dist=True,
         )
 
+    def _on_retrieval_epoch_end(self, phase: RetrievalPhase) -> None:
+        outputs = self.val_outputs if phase == "val" else self.test_outputs
+        dataset = (
+            self.trainer.datamodule.data_val
+            if phase == "val"
+            else self.trainer.datamodule.data_test
+        )
+
+        try:
+            gathered = self._gather_retrieval_outputs(outputs=outputs, phase=phase)
+
+            # No rank produced outputs, e.g. an empty/special-purpose dataloader.
+            if gathered is None:
+                return
+
+            data = self._evaluate_retrieval_epoch(
+                gathered=gathered, dataset=dataset, phase=phase
+            )
+
+            self.log_dict(
+                data.metrics,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                sync_dist=False,
+            )
+
+            is_new_best = False
+            if phase == "val":
+                is_new_best = self._update_validation_best_metrics(data.metrics)
+                self._log_validation_batch_metrics()
+
+            should_save_diagnostics = (
+                self.trainer.is_global_zero
+                and not self.trainer.sanity_checking
+                and (is_new_best if phase == "val" else True)
+            )
+
+            if should_save_diagnostics:
+                self._save_retrieval_diagnostics(
+                    sim_matrix=data.sim_matrix,
+                    img_ids=data.img_ids,
+                    txt_img_ids=data.txt_img_ids,
+                    sample_ids=data.sample_ids,
+                    group_ids=data.group_ids,
+                    text_ids=data.text_ids,
+                    text_group_ids=data.text_group_ids,
+                    text_valid_mask=data.text_valid_mask,
+                    metadata=data.metadata,
+                    phase=phase,
+                    top_k=10,
+                    max_queries_per_direction=15,
+                )
+        finally:
+            # Reset even if metric computation or diagnostic logging raises.
+            self._reset_retrieval_epoch_state(phase)
+
     def _gather_retrieval_outputs(
         self, outputs: dict[str, list[Tensor]], phase: RetrievalPhase
     ) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
@@ -884,63 +941,6 @@ class Mamba3LitModule(LightningModule):
             self.val_batch_t2i_r1.reset()
         else:
             self.test_outputs = self._empty_retrieval_outputs()
-
-    def _on_retrieval_epoch_end(self, phase: RetrievalPhase) -> None:
-        outputs = self.val_outputs if phase == "val" else self.test_outputs
-        dataset = (
-            self.trainer.datamodule.data_val
-            if phase == "val"
-            else self.trainer.datamodule.data_test
-        )
-
-        try:
-            gathered = self._gather_retrieval_outputs(outputs=outputs, phase=phase)
-
-            # No rank produced outputs, e.g. an empty/special-purpose dataloader.
-            if gathered is None:
-                return
-
-            data = self._evaluate_retrieval_epoch(
-                gathered=gathered, dataset=dataset, phase=phase
-            )
-
-            self.log_dict(
-                data.metrics,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=False,
-            )
-
-            is_new_best = False
-            if phase == "val":
-                is_new_best = self._update_validation_best_metrics(data.metrics)
-                self._log_validation_batch_metrics()
-
-            should_save_diagnostics = (
-                self.trainer.is_global_zero
-                and not self.trainer.sanity_checking
-                and (is_new_best if phase == "val" else True)
-            )
-
-            if should_save_diagnostics:
-                self._save_retrieval_diagnostics(
-                    sim_matrix=data.sim_matrix,
-                    img_ids=data.img_ids,
-                    txt_img_ids=data.txt_img_ids,
-                    sample_ids=data.sample_ids,
-                    group_ids=data.group_ids,
-                    text_ids=data.text_ids,
-                    text_group_ids=data.text_group_ids,
-                    text_valid_mask=data.text_valid_mask,
-                    metadata=data.metadata,
-                    phase=phase,
-                    top_k=10,
-                    max_queries_per_direction=15,
-                )
-        finally:
-            # Reset even if metric computation or diagnostic logging raises.
-            self._reset_retrieval_epoch_state(phase)
 
     def on_validation_epoch_end(self) -> None:
         "Lightning hook that is called when a validation epoch ends."
