@@ -1,19 +1,20 @@
 import gc
-from typing import Any, Dict, Tuple  # noqa: UP035
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 from lightning import LightningModule
 from lightning.pytorch.loggers import WandbLogger
+from torch import Tensor
 from torchmetrics import MaxMetric, MeanMetric
 
 
 def multi_positive_cross_entropy(
-    logits: torch.Tensor,
-    positive_mask: torch.Tensor,
-) -> torch.Tensor:
+    logits: Tensor,
+    positive_mask: Tensor,
+) -> Tensor:
     if logits.shape != positive_mask.shape:
         raise ValueError(
             f"Shape mismatch: logits={tuple(logits.shape)}, "
@@ -35,45 +36,6 @@ def multi_positive_cross_entropy(
     return -(targets * log_probs).sum(dim=1).mean()
 
 
-# class RetrievalRecallWrapper:
-#     """
-#     Wrapper for official TorchMetrics RetrievalRecall that handles similarity matrices.
-#     """
-
-#     def __init__(self, k=1):
-#         self.k = k
-#         self.mean_metric = MeanMetric()
-
-#     def update(self, logits):
-#         """
-#         Update metric with similarity matrix.
-
-#         Args:
-#             logits: [batch_size, batch_size] similarity matrix
-#         """
-#         batch_size = logits.shape[0]
-#         target = torch.arange(batch_size, device=logits.device)
-
-#         # Get indices of top k matches
-#         _, top_k_indices = logits.topk(self.k, dim=1)
-
-#         # Check if target is in top_k (matches along dim 1)
-#         correct = (top_k_indices == target.view(-1, 1)).any(dim=1)
-
-#         # Ensure mean_metric is on same device as input
-#         if self.mean_metric.device != logits.device:
-#             self.mean_metric = self.mean_metric.to(logits.device)
-
-#         # Update your internal MeanMetric
-#         self.mean_metric.update(correct.float())
-
-#     def compute(self):
-#         return self.mean_metric.compute()
-
-#     def reset(self):
-#         self.mean_metric.reset()
-
-
 class RetrievalRecallWrapper:
     def __init__(self, k=1):
         self.k = k
@@ -81,8 +43,8 @@ class RetrievalRecallWrapper:
 
     def update(
         self,
-        logits: torch.Tensor,
-        relevant: torch.Tensor | None = None,
+        logits: Tensor,
+        relevant: Tensor | None = None,
     ):
         if relevant is None:
             relevant = torch.eye(
@@ -116,6 +78,27 @@ class RetrievalRecallWrapper:
 
     def reset(self):
         self.mean_metric.reset()
+
+
+RetrievalPhase = Literal["val", "test"]
+
+
+@dataclass
+class RetrievalEpochData:
+    img_embs: Tensor
+    txt_embs: Tensor
+    img_ids: Tensor
+    txt_img_ids: Tensor
+
+    sample_ids: list[str]
+    group_ids: list[str]
+    text_ids: list[str]
+    text_group_ids: list[str]
+    text_valid_mask: list[bool]
+    metadata: list[dict[str, Any]]
+
+    sim_matrix: Tensor
+    metrics: dict[str, Tensor]
 
 
 class Mamba3LitModule(LightningModule):
@@ -170,7 +153,6 @@ class Mamba3LitModule(LightningModule):
         :param scheduler: The learning rate scheduler to use for training.
         """
         super().__init__()
-        d_model = image_net.d_model
 
         # Multiscale augmentation parameters
         self.base_size = 224
@@ -203,13 +185,6 @@ class Mamba3LitModule(LightningModule):
             torch.ones([]) * torch.log(torch.tensor(1 / logit_scale_init))
         )
 
-        self.val_outputs = {
-            "img_embs": [],
-            "txt_embs": [],
-            "img_ids": [],
-            "txt_img_ids": [],
-        }
-
         # TODO: Make more complicated contrastive loss?
         # loss function
         self.criterion = torch.nn.CrossEntropyLoss()
@@ -231,17 +206,12 @@ class Mamba3LitModule(LightningModule):
         self.val_t2i_r1_best = MaxMetric()
         self.val_mean_r1_best = MaxMetric()
 
-        # Initialize test outputs storage
-        self.test_outputs = {
-            "img_embs": [],
-            "txt_embs": [],
-            "img_ids": [],
-            "txt_img_ids": [],
-        }
+        self.val_outputs = self._empty_retrieval_outputs()
+        self.test_outputs = self._empty_retrieval_outputs()
 
     def forward(
-        self, x: torch.Tensor, modality="image", attention_mask=None, raw_texts=None
-    ) -> torch.Tensor:
+        self, x: Tensor, modality="image", attention_mask=None, raw_texts=None
+    ) -> Tensor:
         """Perform a forward pass through the model `self.net`.
 
         :param x: A tensor of images, or token ids for text (ignored when the
@@ -306,7 +276,7 @@ class Mamba3LitModule(LightningModule):
 
     def model_step(
         self,
-        batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        batch: tuple[Tensor, Tensor, Tensor],
         raw_texts=None,
     ):
         """Perform a single model step on a batch of data.
@@ -329,8 +299,8 @@ class Mamba3LitModule(LightningModule):
             texts, modality="text", attention_mask=attention_mask, raw_texts=raw_texts
         )
 
-        img_emb = torch.nn.functional.normalize(img_emb, p=2, dim=-1)
-        txt_emb = torch.nn.functional.normalize(txt_emb, p=2, dim=-1)
+        img_emb = F.normalize(img_emb, p=2, dim=-1)
+        txt_emb = F.normalize(txt_emb, p=2, dim=-1)
 
         with torch.no_grad():
             # Clamping prevents the exponential matrix from blowing up to Infinity
@@ -359,9 +329,9 @@ class Mamba3LitModule(LightningModule):
 
     def training_step(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        batch: tuple[Tensor, Tensor, Tensor, list[str]],
         batch_idx: int,
-    ) -> torch.Tensor:
+    ) -> Tensor:
         """Perform a single training step on a batch of data from the training set.
 
         :param batch: A batch of data (a tuple) containing the input tensor of images and target
@@ -427,7 +397,7 @@ class Mamba3LitModule(LightningModule):
 
     def validation_step(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch: tuple[Tensor, Tensor, Tensor, Tensor, list[str]],
         batch_idx: int,
     ) -> None:
         """Perform a single validation step on a batch of data from the validation set.
@@ -447,6 +417,11 @@ class Mamba3LitModule(LightningModule):
             self.image_model.vit.image_size = self.base_size
 
         B, C, L = texts.shape
+        if len(text_strings) != B * C:
+            raise RuntimeError(
+                f"Expected {B * C} flattened text strings, got {len(text_strings)}"
+            )
+
         anchor_texts = texts[:, 0, :]
         anchor_mask = attention_mask[:, 0, :]
         anchor_texts_str = text_strings[0::C]  # index 0 of each image's C captions
@@ -475,7 +450,7 @@ class Mamba3LitModule(LightningModule):
             attention_mask=mask_flat,
             raw_texts=text_strings,
         )
-        txt_emb_all = torch.nn.functional.normalize(txt_emb_all, p=2, dim=-1)
+        txt_emb_all = F.normalize(txt_emb_all, p=2, dim=-1)
 
         txt_img_ids = image_ids.to(img_emb.device).repeat_interleave(C)
 
@@ -494,39 +469,39 @@ class Mamba3LitModule(LightningModule):
             sync_dist=True,
         )
 
-    def on_validation_epoch_end(self) -> None:
-        "Lightning hook that is called when a validation epoch ends."
-
-        # Safety guard
+    def _gather_retrieval_outputs(
+        self, outputs: dict[str, list[Tensor]], phase: RetrievalPhase
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
         has_local = torch.tensor(
-            [bool(self.val_outputs["img_embs"])], device=self.device, dtype=torch.bool
+            [bool(outputs["img_embs"])], device=self.device, dtype=torch.bool
         )
         has_outputs = self.all_gather(has_local).flatten()
 
         if not has_outputs.any():
-            return
+            return None
+
         if not has_outputs.all():
-            raise RuntimeError("Some DDP ranks produced no validation embeddings")
-
-        # Gather tensors
-        local_img = torch.cat(self.val_outputs["img_embs"]).to(self.device)
-        local_txt = torch.cat(self.val_outputs["txt_embs"]).to(self.device)
-        local_img_ids = torch.cat(self.val_outputs["img_ids"]).to(self.device)
-        local_txt_img_ids = torch.cat(self.val_outputs["txt_img_ids"]).to(self.device)
-
-        local_n_img = torch.tensor([local_img.shape[0]], device=self.device)
-        local_n_txt = torch.tensor([local_txt.shape[0]], device=self.device)
-        rank_n_img = self.all_gather(local_n_img).flatten()
-        rank_n_txt = self.all_gather(local_n_txt).flatten()
-
-        if not torch.all(rank_n_img == rank_n_img[0]):
             raise RuntimeError(
-                f"Unequal image counts across ranks: {rank_n_img.tolist()}"
+                f"Some DDP ranks produced no {phase} retrieval embeddings"
             )
-        if not torch.all(rank_n_txt == rank_n_txt[0]):
+
+        local_img = torch.cat(outputs["img_embs"], dim=0).to(self.device)
+        local_txt = torch.cat(outputs["txt_embs"], dim=0).to(self.device)
+        local_img_ids = torch.cat(outputs["img_ids"], dim=0).to(self.device)
+        local_txt_img_ids = torch.cat(outputs["txt_img_ids"], dim=0).to(self.device)
+
+        if local_img.ndim != 2 or local_txt.ndim != 2:
             raise RuntimeError(
-                f"Unequal text counts across ranks: {rank_n_txt.tolist()}"
+                f"Expected local [N, D] embeddings during {phase}, got "
+                f"image={tuple(local_img.shape)}, text={tuple(local_txt.shape)}"
             )
+
+        self._validate_equal_ddp_counts(
+            local_count=local_img.shape[0], value_name=f"{phase} image"
+        )
+        self._validate_equal_ddp_counts(
+            local_count=local_txt.shape[0], value_name=f"{phase} text"
+        )
 
         all_img = self.all_gather(local_img, sync_grads=False).reshape(
             -1, local_img.shape[-1]
@@ -534,260 +509,360 @@ class Mamba3LitModule(LightningModule):
         all_txt = self.all_gather(local_txt, sync_grads=False).reshape(
             -1, local_txt.shape[-1]
         )
-
         all_img_ids = self.all_gather(local_img_ids).reshape(-1)
         all_txt_img_ids = self.all_gather(local_txt_img_ids).reshape(-1)
 
-        if all_img.shape[0] == 0:
-            raise RuntimeError("No gathered image embeddings.")
-        if all_txt.shape[0] % all_img.shape[0] != 0:
+        self._validate_caption_blocks(
+            img_embs=all_img,
+            txt_embs=all_txt,
+            img_ids=all_img_ids,
+            txt_img_ids=all_txt_img_ids,
+        )
+
+        return self._drop_duplicate_image_blocks(
+            img_embs=all_img,
+            txt_embs=all_txt,
+            img_ids=all_img_ids,
+            txt_img_ids=all_txt_img_ids,
+        )
+
+    def _validate_equal_ddp_counts(self, local_count: int, value_name: str) -> None:
+        local_count_tensor = torch.tensor(
+            [local_count], device=self.device, dtype=torch.long
+        )
+        rank_counts = self.all_gather(local_count_tensor).flatten()
+
+        if not torch.all(rank_counts == rank_counts[0]):
             raise RuntimeError(
-                "Text embedding count is not divisible by image count: "
-                f"{all_txt.shape[0]} texts vs {all_img.shape[0]} images"
+                f"Unequal {value_name} counts across ranks: "
+                f"{rank_counts.detach().cpu().tolist()}"
             )
 
-        captions_per_image = all_txt.shape[0] // all_img.shape[0]
+    def _validate_caption_blocks(
+        self, img_embs: Tensor, txt_embs: Tensor, img_ids: Tensor, txt_img_ids: Tensor
+    ) -> None:
+        if img_embs.shape[0] == 0:
+            raise RuntimeError("No gathered image embeddings.")
 
-        # Validate that each text block belongs to the corresponding image.
-        for image_position in range(all_img.shape[0]):
+        if txt_embs.shape[0] % img_embs.shape[0] != 0:
+            raise RuntimeError(
+                "Text embedding count is not divisible by image count: "
+                f"{txt_embs.shape[0]} texts vs {img_embs.shape[0]} images"
+            )
+
+        if img_ids.numel() != img_embs.shape[0]:
+            raise RuntimeError(
+                "Image ID count does not match image embeddings: "
+                f"{img_ids.numel()} IDs vs {img_embs.shape[0]} embeddings"
+            )
+
+        if txt_img_ids.numel() != txt_embs.shape[0]:
+            raise RuntimeError(
+                "Text parent ID count does not match text embeddings: "
+                f"{txt_img_ids.numel()} IDs vs {txt_embs.shape[0]} embeddings"
+            )
+
+        captions_per_image = txt_embs.shape[0] // img_embs.shape[0]
+
+        for image_position in range(img_embs.shape[0]):
             start = image_position * captions_per_image
             stop = start + captions_per_image
 
-            block_parent_ids = all_txt_img_ids[start:stop]
-            expected_parent_id = all_img_ids[image_position]
+            block_parent_ids = txt_img_ids[start:stop]
+            expected_parent_id = img_ids[image_position]
 
             if not torch.all(block_parent_ids == expected_parent_id):
                 raise RuntimeError(
                     "Image/text gathering order is misaligned at image position "
                     f"{image_position}: image_id={int(expected_parent_id)}, "
-                    f"text_parent_ids={block_parent_ids.detach().cpu().tolist()}"
+                    "text_parent_ids="
+                    f"{block_parent_ids.detach().cpu().tolist()}"
                 )
 
-        # DistributedSampler can repeat examples to make every rank equally sized.
-        # Keep the first complete image-caption block for each dataset index.
-        seen_image_ids = set()
-        keep_image_positions = []
+    def _drop_duplicate_image_blocks(
+        self, img_embs: Tensor, txt_embs: Tensor, img_ids: Tensor, txt_img_ids: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        captions_per_image = txt_embs.shape[0] // img_embs.shape[0]
 
-        for position, dataset_idx in enumerate(all_img_ids.detach().cpu().tolist()):
+        seen: set[int] = set()
+        keep_image_positions: list[int] = []
+
+        for position, dataset_idx in enumerate(img_ids.detach().cpu().tolist()):
             dataset_idx = int(dataset_idx)
-
-            if dataset_idx not in seen_image_ids:
-                seen_image_ids.add(dataset_idx)
+            if dataset_idx not in seen:
+                seen.add(dataset_idx)
                 keep_image_positions.append(position)
 
-        if len(keep_image_positions) != all_img.shape[0]:
-            print("Duplicated captions by DistributedSampler detected!")
-            keep_image_tensor = torch.tensor(
-                keep_image_positions, dtype=torch.long, device=all_img.device
+        if len(keep_image_positions) == img_embs.shape[0]:
+            return img_embs, txt_embs, img_ids, txt_img_ids
+
+        if self.trainer.is_global_zero:
+            print(
+                "Duplicates introduced by DistributedSampler detected; removing them."
             )
 
-            keep_text_positions = [
-                image_position * captions_per_image + caption_position
-                for image_position in keep_image_positions
-                for caption_position in range(captions_per_image)
-            ]
-            keep_text_tensor = torch.tensor(
-                keep_text_positions, dtype=torch.long, device=all_txt.device
-            )
+        keep_image_tensor = torch.as_tensor(
+            keep_image_positions, dtype=torch.long, device=img_embs.device
+        )
 
-            all_img = all_img.index_select(0, keep_image_tensor)
-            all_img_ids = all_img_ids.index_select(0, keep_image_tensor)
-
-            all_txt = all_txt.index_select(0, keep_text_tensor)
-            all_txt_img_ids = all_txt_img_ids.index_select(0, keep_text_tensor)
-
-        # Translate gathered Dataset indexes into stable GAIA identifiers.
-        val_dataset = self.trainer.datamodule.data_val
-
-        all_image_metadata = [
-            val_dataset.get_retrieval_metadata(int(dataset_idx))
-            for dataset_idx in all_img_ids.detach().cpu().tolist()
+        keep_text_positions = [
+            image_position * captions_per_image + caption_position
+            for image_position in keep_image_positions
+            for caption_position in range(captions_per_image)
         ]
+        keep_text_tensor = torch.as_tensor(
+            keep_text_positions, dtype=torch.long, device=txt_embs.device
+        )
 
-        all_sample_ids = [metadata["sample_id"] for metadata in all_image_metadata]
-        all_group_ids = [metadata["group_id"] for metadata in all_image_metadata]
+        return (
+            img_embs.index_select(0, keep_image_tensor),
+            txt_embs.index_select(0, keep_text_tensor),
+            img_ids.index_select(0, keep_image_tensor),
+            txt_img_ids.index_select(0, keep_text_tensor),
+        )
 
-        all_text_ids = []
-        all_text_group_ids = []
-        all_text_valid_mask = []
+    def _evaluate_retrieval_epoch(
+        self,
+        gathered: tuple[Tensor, Tensor, Tensor, Tensor],
+        dataset,
+        phase: RetrievalPhase,
+    ) -> RetrievalEpochData:
+        all_img, all_txt, all_img_ids, all_txt_img_ids = gathered
 
-        for metadata in all_image_metadata:
-            text_ids = list(metadata["text_ids"])
-            num_valid = metadata["num_valid_captions"]
+        captions_per_image = all_txt.shape[0] // all_img.shape[0]
 
-            while len(text_ids) < captions_per_image:
-                padding_position = len(text_ids)
-                text_ids.append(f"{metadata['sample_id']}:padding:{padding_position}")
-
-            text_ids = text_ids[:captions_per_image]
-
-            all_text_ids.extend(text_ids)
-            all_text_group_ids.extend([metadata["group_id"]] * captions_per_image)
-            all_text_valid_mask.extend(
-                [
-                    caption_position < num_valid
-                    for caption_position in range(captions_per_image)
-                ]
+        (metadata, sample_ids, group_ids, text_ids, text_group_ids, text_valid_mask) = (
+            self._build_retrieval_metadata(
+                dataset=dataset,
+                img_ids=all_img_ids,
+                captions_per_image=captions_per_image,
             )
+        )
 
-        if len(all_sample_ids) != all_img.shape[0]:
+        if len(sample_ids) != all_img.shape[0]:
             raise RuntimeError(
                 "Stable image ID count does not match image embeddings: "
-                f"{len(all_sample_ids)} IDs vs "
-                f"{all_img.shape[0]} embeddings"
+                f"{len(sample_ids)} IDs vs {all_img.shape[0]} embeddings"
             )
 
-        if len(all_text_ids) != all_txt.shape[0]:
+        if len(text_ids) != all_txt.shape[0]:
             raise RuntimeError(
                 "Stable text ID count does not match text embeddings: "
-                f"{len(all_text_ids)} IDs vs "
-                f"{all_txt.shape[0]} embeddings"
+                f"{len(text_ids)} IDs vs {all_txt.shape[0]} embeddings"
             )
 
-        if all_img.ndim != 2 or all_txt.ndim != 2:
-            raise RuntimeError(
-                f"Expected 2-D embeddings, got "
-                f"image={tuple(all_img.shape)}, text={tuple(all_txt.shape)}"
-            )
+        all_img = F.normalize(all_img, p=2, dim=-1)
+        all_txt = F.normalize(all_txt, p=2, dim=-1)
 
-        # Normalize and compute Global Similarity Matrix
-        all_img = torch.nn.functional.normalize(all_img, p=2, dim=-1)
-        all_txt = torch.nn.functional.normalize(all_txt, p=2, dim=-1)
-
-        image_norms = all_img.norm(dim=1)
-        text_norms = all_txt.norm(dim=1)
-
-        if not torch.allclose(image_norms, torch.ones_like(image_norms), atol=1e-4):
-            raise RuntimeError("Image embeddings are not L2-normalized.")
-        if not torch.allclose(text_norms, torch.ones_like(text_norms), atol=1e-4):
-            raise RuntimeError("Text embeddings are not L2-normalized.")
+        self._validate_normalized_embeddings(all_img, all_txt)
 
         sim_matrix = all_img @ all_txt.t()
-
-        if sim_matrix.ndim != 2:
-            raise RuntimeError(
-                f"Expected 2-D similarity matrix, got {sim_matrix.shape}"
-            )
-
-        # Multi-relevant ground truth: text j is relevant to image i iff they
-        # share the same source-image id (standard 5-captions-per-image
-        # protocol), not just the diagonal
-        relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(
-            0
-        )  # [N_img, N_txt]
+        relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(0)
 
         if relevant.shape != sim_matrix.shape:
             raise RuntimeError(
-                f"Relevance/similarity mismatch: "
+                "Relevance/similarity mismatch: "
                 f"relevant={tuple(relevant.shape)}, "
                 f"similarity={tuple(sim_matrix.shape)}"
             )
 
         if not relevant.any(dim=1).all():
             raise RuntimeError("At least one image has no relevant caption.")
+
         if not relevant.any(dim=0).all():
             raise RuntimeError("At least one caption has no owning image.")
 
         valid_text_mask_tensor = torch.as_tensor(
-            all_text_valid_mask, dtype=torch.bool, device=sim_matrix.device
+            text_valid_mask, dtype=torch.bool, device=sim_matrix.device
         )
 
-        # I2T:
-        # - every image is a query;
-        # - padded text candidates are removed.
         i2t_scores = sim_matrix[:, valid_text_mask_tensor]
         i2t_relevant = relevant[:, valid_text_mask_tensor]
 
-        # T2I:
-        # - every valid text is a query;
-        # - every image is a candidate.
-        t2i_scores = sim_matrix[:, valid_text_mask_tensor].t()
-        t2i_relevant = relevant[:, valid_text_mask_tensor].t()
+        t2i_scores = i2t_scores.t()
+        t2i_relevant = i2t_relevant.t()
+
+        metrics = self._compute_retrieval_epoch_metrics(
+            i2t_scores=i2t_scores,
+            i2t_relevant=i2t_relevant,
+            t2i_scores=t2i_scores,
+            t2i_relevant=t2i_relevant,
+            phase=phase,
+        )
+
+        metrics[f"{phase}/global_num_images"] = torch.tensor(
+            all_img.shape[0], device=self.device, dtype=torch.float32
+        )
+        metrics[f"{phase}/global_num_texts"] = valid_text_mask_tensor.sum().float()
+
+        return RetrievalEpochData(
+            img_embs=all_img,
+            txt_embs=all_txt,
+            img_ids=all_img_ids,
+            txt_img_ids=all_txt_img_ids,
+            sample_ids=sample_ids,
+            group_ids=group_ids,
+            text_ids=text_ids,
+            text_group_ids=text_group_ids,
+            text_valid_mask=text_valid_mask,
+            metadata=metadata,
+            sim_matrix=sim_matrix,
+            metrics=metrics,
+        )
+
+    def _build_retrieval_metadata(
+        self, dataset, img_ids: Tensor, captions_per_image: int
+    ) -> tuple[list[dict], list[str], list[str], list[str], list[str], list[bool]]:
+        metadata = [
+            dataset.get_retrieval_metadata(int(dataset_idx))
+            for dataset_idx in img_ids.detach().cpu().tolist()
+        ]
+
+        sample_ids = [item["sample_id"] for item in metadata]
+        group_ids = [item["group_id"] for item in metadata]
+
+        text_ids: list[str] = []
+        text_group_ids: list[str] = []
+        text_valid_mask: list[bool] = []
+
+        for item in metadata:
+            current_text_ids = list(item["text_ids"])
+            reported_num_valid = int(item["num_valid_captions"])
+
+            if reported_num_valid < 0:
+                raise RuntimeError(
+                    f"Negative num_valid_captions for sample {item['sample_id']}: "
+                    f"{reported_num_valid}"
+                )
+            if reported_num_valid > len(current_text_ids):
+                raise RuntimeError(
+                    f"Sample {item['sample_id']} reports "
+                    f"{reported_num_valid} valid captions but provides only "
+                    f"{len(current_text_ids)} text IDs"
+                )
+            if len(current_text_ids) > captions_per_image:
+                raise RuntimeError(
+                    f"Metadata for sample {item['sample_id']} contains "
+                    f"{len(current_text_ids)} text IDs, but only "
+                    f"{captions_per_image} captions were encoded"
+                )
+
+            num_valid = min(reported_num_valid, captions_per_image)
+
+            while len(current_text_ids) < captions_per_image:
+                position = len(current_text_ids)
+                current_text_ids.append(f"{item['sample_id']}:padding:{position}")
+
+            text_ids.extend(current_text_ids)
+            text_group_ids.extend([item["group_id"]] * captions_per_image)
+            text_valid_mask.extend(
+                position < num_valid for position in range(captions_per_image)
+            )
+
+        return (
+            metadata,
+            sample_ids,
+            group_ids,
+            text_ids,
+            text_group_ids,
+            text_valid_mask,
+        )
+
+    def _validate_normalized_embeddings(
+        self, img_embs: Tensor, txt_embs: Tensor
+    ) -> None:
+        image_norms = img_embs.norm(dim=1)
+        text_norms = txt_embs.norm(dim=1)
+
+        if not torch.allclose(image_norms, torch.ones_like(image_norms), atol=1e-4):
+            raise RuntimeError("Image embeddings are not L2-normalized.")
+
+        if not torch.allclose(text_norms, torch.ones_like(text_norms), atol=1e-4):
+            raise RuntimeError("Text embeddings are not L2-normalized.")
+
+    def _compute_retrieval_epoch_metrics(
+        self,
+        i2t_scores: Tensor,
+        i2t_relevant: Tensor,
+        t2i_scores: Tensor,
+        t2i_relevant: Tensor,
+        phase: RetrievalPhase,
+    ) -> dict[str, Tensor]:
+        if i2t_scores.shape[1] == 0:
+            raise RuntimeError(f"There are no valid {phase} text candidates.")
+        if t2i_scores.shape[1] == 0:
+            raise RuntimeError(f"There are no valid {phase} image candidates.")
 
         i2t_ranking = self._compute_ranking_metrics(i2t_scores, i2t_relevant)
         t2i_ranking = self._compute_ranking_metrics(t2i_scores, t2i_relevant)
 
-        # 3. Calculate R@1, R@5, R@10 for both directions
-        val_results = {}
-        for k in [1, 5, 10, 20]:
-            # Image-to-text over valid caption candidates only.
-            kk_i2t = min(k, i2t_scores.shape[1])
-            top_k_i2t = i2t_scores.topk(kk_i2t, dim=1).indices
-            r_i2t = i2t_relevant.gather(1, top_k_i2t).any(dim=1).float().mean()
-            val_results[f"val/I2T_R{k}"] = r_i2t
+        results: dict[str, Tensor] = {}
 
-            # Text-to-image over valid text queries only.
-            kk_t2i = min(k, t2i_scores.shape[1])
-            top_k_t2i = t2i_scores.topk(kk_t2i, dim=1).indices
-            r_t2i = t2i_relevant.gather(1, top_k_t2i).any(dim=1).float().mean()
-            val_results[f"val/T2I_R{k}"] = r_t2i
+        for k in (1, 5, 10, 20):
+            i2t_k = min(k, i2t_scores.shape[1])
+            i2t_topk = i2t_scores.topk(i2t_k, dim=1).indices
+            results[f"{phase}/I2T_R{k}"] = (
+                i2t_relevant.gather(1, i2t_topk).any(dim=1).float().mean()
+            )
 
-        val_results["val/mean_R1"] = 0.5 * (
-            val_results["val/I2T_R1"] + val_results["val/T2I_R1"]
+            t2i_k = min(k, t2i_scores.shape[1])
+            t2i_topk = t2i_scores.topk(t2i_k, dim=1).indices
+            results[f"{phase}/T2I_R{k}"] = (
+                t2i_relevant.gather(1, t2i_topk).any(dim=1).float().mean()
+            )
+
+        results[f"{phase}/mean_R1"] = 0.5 * (
+            results[f"{phase}/I2T_R1"] + results[f"{phase}/T2I_R1"]
         )
 
         for metric_name, value in i2t_ranking.items():
-            val_results[f"val/I2T_{metric_name}"] = value
-        for metric_name, value in t2i_ranking.items():
-            val_results[f"val/T2I_{metric_name}"] = value
+            results[f"{phase}/I2T_{metric_name}"] = value
 
-        # MRR has the same first-positive interpretation in both directions.
-        # nDCG is normalized for the number of relevant candidates.
-        #
-        # Do not average mAP across directions:
-        # - I2T AP evaluates all relevant captions;
-        # - T2I AP equals reciprocal rank when each caption has one image.
-        for metric_name in ["MRR", "nDCG"]:
-            val_results[f"val/mean_{metric_name}"] = 0.5 * (
+        for metric_name, value in t2i_ranking.items():
+            results[f"{phase}/T2I_{metric_name}"] = value
+
+        # mAP is intentionally not averaged because its interpretation differs
+        # between I2T and T2I in this retrieval setup.
+        for metric_name in ("MRR", "nDCG"):
+            results[f"{phase}/mean_{metric_name}"] = 0.5 * (
                 i2t_ranking[metric_name] + t2i_ranking[metric_name]
             )
 
-        val_results["val/global_num_images"] = torch.tensor(
-            all_img.shape[0], device=self.device, dtype=torch.float32
-        )
-        val_results["val/global_num_texts"] = valid_text_mask_tensor.sum().float()
+        return results
 
-        # 4. Log all metrics to WandB/Progress Bar
-        self.log_dict(
-            val_results, on_step=False, on_epoch=True, prog_bar=True, sync_dist=False
-        )
+    def _update_validation_best_metrics(self, metrics: dict[str, Tensor]) -> bool:
+        if self.trainer.sanity_checking:
+            return False
 
-        # 5. Update "Best" trackers (Usually tracked via R1)
-        is_new_best = False
+        current_i2t = metrics["val/I2T_R1"].detach()
+        current_t2i = metrics["val/T2I_R1"].detach()
+        current_mean = metrics["val/mean_R1"].detach()
 
-        if not self.trainer.sanity_checking:
-            current_i2t = val_results["val/I2T_R1"].detach()
-            current_t2i = val_results["val/T2I_R1"].detach()
-            current_mean = val_results["val/mean_R1"].detach()
+        # Compare before updating if diagnostics should only be saved for a strict
+        # improvement. The previous implementation also treated exact ties as best.
+        previous_best = self.val_mean_r1_best.compute().detach().clone()
 
-            self.val_i2t_r1_best(current_i2t)
-            self.val_t2i_r1_best(current_t2i)
-            self.val_mean_r1_best(current_mean)
+        self.val_i2t_r1_best(current_i2t)
+        self.val_t2i_r1_best(current_t2i)
+        self.val_mean_r1_best(current_mean)
 
-            best_i2t = self.val_i2t_r1_best.compute()
-            best_t2i = self.val_t2i_r1_best.compute()
-            best_mean = self.val_mean_r1_best.compute()
+        best_i2t = self.val_i2t_r1_best.compute()
+        best_t2i = self.val_t2i_r1_best.compute()
+        best_mean = self.val_mean_r1_best.compute()
 
-            self.log("val/I2T_R1_best", best_i2t, sync_dist=False)
-            self.log("val/T2I_R1_best", best_t2i, sync_dist=False)
-            self.log("val/mean_R1_best", best_mean, sync_dist=False)
+        self.log("val/I2T_R1_best", best_i2t, sync_dist=False)
+        self.log("val/T2I_R1_best", best_t2i, sync_dist=False)
+        self.log("val/mean_R1_best", best_mean, sync_dist=False)
 
-            # True for a new best or an exact tie with the best.
-            is_new_best = bool(
-                torch.isclose(
-                    current_mean.float(), best_mean.float(), rtol=0.0, atol=1e-12
-                ).item()
-            )
+        # Use >= instead if exact ties should also regenerate diagnostics.
+        return bool((current_mean > previous_best).item())
 
-        batch_i2t_r1 = self.val_batch_i2t_r1.compute()
-        batch_t2i_r1 = self.val_batch_t2i_r1.compute()
-
-        # Ensure Lightning receives tensors rather than wrapper objects.
+    def _log_validation_batch_metrics(self) -> None:
         batch_i2t_r1 = torch.as_tensor(
-            batch_i2t_r1, device=self.device, dtype=torch.float32
+            self.val_batch_i2t_r1.compute(), device=self.device, dtype=torch.float32
         )
         batch_t2i_r1 = torch.as_tensor(
-            batch_t2i_r1, device=self.device, dtype=torch.float32
+            self.val_batch_t2i_r1.compute(), device=self.device, dtype=torch.float32
         )
 
         self.log_dict(
@@ -798,55 +873,83 @@ class Mamba3LitModule(LightningModule):
             sync_dist=True,
         )
 
-        # 6. Save visual results table
-        if (
-            self.trainer.is_global_zero
-            and not self.trainer.sanity_checking
-            and is_new_best
-        ):
-            self._save_retrieval_diagnostics(
-                sim_matrix=sim_matrix,
-                img_ids=all_img_ids,
-                txt_img_ids=all_txt_img_ids,
-                sample_ids=all_sample_ids,
-                group_ids=all_group_ids,
-                text_ids=all_text_ids,
-                text_group_ids=all_text_group_ids,
-                text_valid_mask=all_text_valid_mask,
-                metadata=all_image_metadata,
-                phase="val",
-                top_k=10,
-                max_queries_per_direction=15,
+    @staticmethod
+    def _empty_retrieval_outputs() -> dict[str, list[Tensor]]:
+        return {"img_embs": [], "txt_embs": [], "img_ids": [], "txt_img_ids": []}
+
+    def _reset_retrieval_epoch_state(self, phase: RetrievalPhase) -> None:
+        if phase == "val":
+            self.val_outputs = self._empty_retrieval_outputs()
+            self.val_batch_i2t_r1.reset()
+            self.val_batch_t2i_r1.reset()
+        else:
+            self.test_outputs = self._empty_retrieval_outputs()
+
+    def _on_retrieval_epoch_end(self, phase: RetrievalPhase) -> None:
+        outputs = self.val_outputs if phase == "val" else self.test_outputs
+        dataset = (
+            self.trainer.datamodule.data_val
+            if phase == "val"
+            else self.trainer.datamodule.data_test
+        )
+
+        try:
+            gathered = self._gather_retrieval_outputs(outputs=outputs, phase=phase)
+
+            # No rank produced outputs, e.g. an empty/special-purpose dataloader.
+            if gathered is None:
+                return
+
+            data = self._evaluate_retrieval_epoch(
+                gathered=gathered, dataset=dataset, phase=phase
             )
-            # self._save_misc_metrics(
-            #     sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="val"
-            # )
 
-        # # Diagnostic to check DistributedSampler repeating samples
-        # if self.trainer.is_global_zero:
-        #     dataset_size = len(self.trainer.datamodule.val_dataloader().dataset)
-        #     world_size = self.trainer.world_size
+            self.log_dict(
+                data.metrics,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                sync_dist=False,
+            )
 
-        #     if dataset_size % world_size != 0:
-        #         print(
-        #             f"Warning: validation size {dataset_size} is not divisible "
-        #             f"by world size {world_size}; DDP may duplicate samples."
-        #         )
+            is_new_best = False
+            if phase == "val":
+                is_new_best = self._update_validation_best_metrics(data.metrics)
+                self._log_validation_batch_metrics()
 
-        # 7. Reset storage for the next epoch
-        self.val_outputs = {
-            "img_embs": [],
-            "txt_embs": [],
-            "img_ids": [],
-            "txt_img_ids": [],
-        }
+            should_save_diagnostics = (
+                self.trainer.is_global_zero
+                and not self.trainer.sanity_checking
+                and (is_new_best if phase == "val" else True)
+            )
 
-        self.val_batch_i2t_r1.reset()
-        self.val_batch_t2i_r1.reset()
+            if should_save_diagnostics:
+                self._save_retrieval_diagnostics(
+                    sim_matrix=data.sim_matrix,
+                    img_ids=data.img_ids,
+                    txt_img_ids=data.txt_img_ids,
+                    sample_ids=data.sample_ids,
+                    group_ids=data.group_ids,
+                    text_ids=data.text_ids,
+                    text_group_ids=data.text_group_ids,
+                    text_valid_mask=data.text_valid_mask,
+                    metadata=data.metadata,
+                    phase=phase,
+                    top_k=10,
+                    max_queries_per_direction=15,
+                )
+        finally:
+            # Reset even if metric computation or diagnostic logging raises.
+            self._reset_retrieval_epoch_state(phase)
+
+    def on_validation_epoch_end(self) -> None:
+        "Lightning hook that is called when a validation epoch ends."
+
+        self._on_retrieval_epoch_end("val")
 
     def test_step(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        batch: tuple[Tensor, Tensor, Tensor, Tensor, list[str]],
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
@@ -863,6 +966,10 @@ class Mamba3LitModule(LightningModule):
             self.image_model.vit.image_size = self.base_size
 
         B, C, L = texts.shape
+        if len(text_strings) != B * C:
+            raise RuntimeError(
+                f"Expected {B * C} flattened text strings, got {len(text_strings)}"
+            )
         anchor_texts = texts[:, 0, :]
         anchor_mask = attention_mask[:, 0, :]
         anchor_texts_str = text_strings[0::C]  # index 0 of each image's C captions
@@ -871,10 +978,10 @@ class Mamba3LitModule(LightningModule):
             (images, anchor_texts, anchor_mask), raw_texts=anchor_texts_str
         )
 
-        # If validation batch is broken, exit early to protect global metric tracking
+        # If the test batch is invalid, do not add partial data to epoch-level metrics.
         if result is None:
             return
-        loss, l_i2t, l_t2i, img_emb, txt_emb = result
+        _, _, _, img_emb, _ = result
 
         if img_emb.ndim == 1:
             img_emb = img_emb.unsqueeze(0)
@@ -887,7 +994,7 @@ class Mamba3LitModule(LightningModule):
             attention_mask=mask_flat,
             raw_texts=text_strings,
         )
-        txt_emb_all = torch.nn.functional.normalize(txt_emb_all, p=2, dim=-1)
+        txt_emb_all = F.normalize(txt_emb_all, p=2, dim=-1)
 
         txt_img_ids = image_ids.to(img_emb.device).repeat_interleave(C)
 
@@ -899,326 +1006,7 @@ class Mamba3LitModule(LightningModule):
     def on_test_epoch_end(self) -> None:
         """Lightning hook that is called when a test epoch ends."""
 
-        has_local = torch.tensor(
-            [bool(self.test_outputs["img_embs"])], device=self.device, dtype=torch.bool
-        )
-        has_outputs = self.all_gather(has_local).flatten()
-
-        if not has_outputs.any():
-            return
-        if not has_outputs.all():
-            raise RuntimeError("Some DDP ranks produced no test embeddings")
-
-        local_img = torch.cat(self.test_outputs["img_embs"]).to(self.device)
-        local_txt = torch.cat(self.test_outputs["txt_embs"]).to(self.device)
-        local_img_ids = torch.cat(self.test_outputs["img_ids"]).to(self.device)
-        local_txt_img_ids = torch.cat(self.test_outputs["txt_img_ids"]).to(self.device)
-
-        if local_img.ndim != 2 or local_txt.ndim != 2:
-            raise RuntimeError(
-                f"Expected local [N, D] embeddings, got "
-                f"image={tuple(local_img.shape)}, "
-                f"text={tuple(local_txt.shape)}"
-            )
-
-        local_n_img = torch.tensor([local_img.shape[0]], device=self.device)
-        local_n_txt = torch.tensor([local_txt.shape[0]], device=self.device)
-        rank_n_img = self.all_gather(local_n_img).flatten()
-        rank_n_txt = self.all_gather(local_n_txt).flatten()
-
-        if not torch.all(rank_n_img == rank_n_img[0]):
-            raise RuntimeError(
-                f"Unequal image counts across ranks: {rank_n_img.tolist()}"
-            )
-        if not torch.all(rank_n_txt == rank_n_txt[0]):
-            raise RuntimeError(
-                f"Unequal text counts across ranks: {rank_n_txt.tolist()}"
-            )
-
-        all_img = self.all_gather(local_img, sync_grads=False).reshape(
-            -1, local_img.shape[-1]
-        )
-        all_txt = self.all_gather(local_txt, sync_grads=False).reshape(
-            -1, local_txt.shape[-1]
-        )
-
-        all_img_ids = self.all_gather(local_img_ids).reshape(-1)
-        all_txt_img_ids = self.all_gather(local_txt_img_ids).reshape(-1)
-
-        if all_img.shape[0] == 0:
-            raise RuntimeError("No gathered image embeddings.")
-        if all_txt.shape[0] % all_img.shape[0] != 0:
-            raise RuntimeError(
-                "Text embedding count is not divisible by image count: "
-                f"{all_txt.shape[0]} texts vs {all_img.shape[0]} images"
-            )
-
-        captions_per_image = all_txt.shape[0] // all_img.shape[0]
-
-        # Validate that each text block belongs to the corresponding image.
-        for image_position in range(all_img.shape[0]):
-            start = image_position * captions_per_image
-            stop = start + captions_per_image
-
-            block_parent_ids = all_txt_img_ids[start:stop]
-            expected_parent_id = all_img_ids[image_position]
-
-            if not torch.all(block_parent_ids == expected_parent_id):
-                raise RuntimeError(
-                    "Image/text gathering order is misaligned at image position "
-                    f"{image_position}: image_id={int(expected_parent_id)}, "
-                    f"text_parent_ids={block_parent_ids.detach().cpu().tolist()}"
-                )
-
-        # DistributedSampler can repeat examples to make every rank equally sized.
-        # Keep the first complete image-caption block for each dataset index.
-        seen_image_ids = set()
-        keep_image_positions = []
-
-        for position, dataset_idx in enumerate(all_img_ids.detach().cpu().tolist()):
-            dataset_idx = int(dataset_idx)
-
-            if dataset_idx not in seen_image_ids:
-                seen_image_ids.add(dataset_idx)
-                keep_image_positions.append(position)
-
-        if len(keep_image_positions) != all_img.shape[0]:
-            print("Duplicated captions by DistributedSampler detected!")
-            keep_image_tensor = torch.tensor(
-                keep_image_positions, dtype=torch.long, device=all_img.device
-            )
-
-            keep_text_positions = [
-                image_position * captions_per_image + caption_position
-                for image_position in keep_image_positions
-                for caption_position in range(captions_per_image)
-            ]
-            keep_text_tensor = torch.tensor(
-                keep_text_positions, dtype=torch.long, device=all_txt.device
-            )
-
-            all_img = all_img.index_select(0, keep_image_tensor)
-            all_img_ids = all_img_ids.index_select(0, keep_image_tensor)
-
-            all_txt = all_txt.index_select(0, keep_text_tensor)
-            all_txt_img_ids = all_txt_img_ids.index_select(0, keep_text_tensor)
-
-        # Translate gathered Dataset indexes into stable GAIA identifiers.
-        test_dataset = self.trainer.datamodule.data_test
-
-        all_image_metadata = [
-            test_dataset.get_retrieval_metadata(int(dataset_idx))
-            for dataset_idx in all_img_ids.detach().cpu().tolist()
-        ]
-
-        all_sample_ids = [metadata["sample_id"] for metadata in all_image_metadata]
-        all_group_ids = [metadata["group_id"] for metadata in all_image_metadata]
-
-        if all_img.shape[0] == 0:
-            raise RuntimeError("No gathered image embeddings.")
-        if all_txt.shape[0] % all_img.shape[0] != 0:
-            raise RuntimeError(
-                "Text embedding count is not divisible by image count: "
-                f"{all_txt.shape[0]} texts vs {all_img.shape[0]} images"
-            )
-
-        captions_per_image = all_txt.shape[0] // all_img.shape[0]
-
-        all_text_ids = []
-        all_text_group_ids = []
-        all_text_valid_mask = []
-
-        for metadata in all_image_metadata:
-            text_ids = list(metadata["text_ids"])
-            num_valid = metadata["num_valid_captions"]
-
-            while len(text_ids) < captions_per_image:
-                padding_position = len(text_ids)
-                text_ids.append(f"{metadata['sample_id']}:padding:{padding_position}")
-
-            text_ids = text_ids[:captions_per_image]
-
-            all_text_ids.extend(text_ids)
-            all_text_group_ids.extend([metadata["group_id"]] * captions_per_image)
-            all_text_valid_mask.extend(
-                [
-                    caption_position < num_valid
-                    for caption_position in range(captions_per_image)
-                ]
-            )
-
-        if len(all_sample_ids) != all_img.shape[0]:
-            raise RuntimeError(
-                "Stable image ID count does not match image embeddings: "
-                f"{len(all_sample_ids)} IDs vs "
-                f"{all_img.shape[0]} embeddings"
-            )
-
-        if len(all_text_ids) != all_txt.shape[0]:
-            raise RuntimeError(
-                "Stable text ID count does not match text embeddings: "
-                f"{len(all_text_ids)} IDs vs "
-                f"{all_txt.shape[0]} embeddings"
-            )
-
-        if all_img.ndim != 2 or all_txt.ndim != 2:
-            raise RuntimeError(
-                f"Expected 2-D embeddings, got "
-                f"image={tuple(all_img.shape)}, text={tuple(all_txt.shape)}"
-            )
-
-        # 2. Normalize and compute Global Similarity Matrix
-        all_img = torch.nn.functional.normalize(all_img, p=2, dim=-1)
-        all_txt = torch.nn.functional.normalize(all_txt, p=2, dim=-1)
-
-        image_norms = all_img.norm(dim=1)
-        text_norms = all_txt.norm(dim=1)
-
-        if not torch.allclose(image_norms, torch.ones_like(image_norms), atol=1e-4):
-            raise RuntimeError("Image embeddings are not L2-normalized.")
-        if not torch.allclose(text_norms, torch.ones_like(text_norms), atol=1e-4):
-            raise RuntimeError("Text embeddings are not L2-normalized.")
-
-        sim_matrix = all_img @ all_txt.t()
-
-        if sim_matrix.ndim != 2:
-            raise RuntimeError(
-                f"Expected 2-D similarity matrix, got {sim_matrix.shape}"
-            )
-
-        # Multi-relevant ground truth: text j is relevant to image i iff they
-        # share the same source-img id (standard 5-captions-per-image
-        # protocol), not just the diagonal
-        relevant = all_img_ids.unsqueeze(1) == all_txt_img_ids.unsqueeze(
-            0
-        )  # [N_img, N_txt]
-
-        if relevant.shape != sim_matrix.shape:
-            raise RuntimeError(
-                f"Relevance/similarity mismatch: "
-                f"relevant={tuple(relevant.shape)}, "
-                f"similarity={tuple(sim_matrix.shape)}"
-            )
-
-        if not relevant.any(dim=1).all():
-            raise RuntimeError("At least one image has no relevant caption.")
-
-        if not relevant.any(dim=0).all():
-            raise RuntimeError("At least one caption has no owning image.")
-
-        valid_text_mask_tensor = torch.as_tensor(
-            all_text_valid_mask, dtype=torch.bool, device=sim_matrix.device
-        )
-
-        i2t_scores = sim_matrix[:, valid_text_mask_tensor]
-        i2t_relevant = relevant[:, valid_text_mask_tensor]
-
-        t2i_scores = sim_matrix[:, valid_text_mask_tensor].t()
-        t2i_relevant = relevant[:, valid_text_mask_tensor].t()
-
-        i2t_ranking = self._compute_ranking_metrics(i2t_scores, i2t_relevant)
-        t2i_ranking = self._compute_ranking_metrics(t2i_scores, t2i_relevant)
-
-        # 3. Calculate R@1, R@5, R@10 for both directions
-        test_results = {}
-        for k in [1, 5, 10, 20]:
-            kk_i2t = min(k, i2t_scores.shape[1])
-            top_k_i2t = i2t_scores.topk(kk_i2t, dim=1).indices
-            r_i2t = i2t_relevant.gather(1, top_k_i2t).any(dim=1).float().mean()
-            test_results[f"test/I2T_R{k}"] = r_i2t
-
-            kk_t2i = min(k, t2i_scores.shape[1])
-            top_k_t2i = t2i_scores.topk(kk_t2i, dim=1).indices
-            r_t2i = t2i_relevant.gather(1, top_k_t2i).any(dim=1).float().mean()
-            test_results[f"test/T2I_R{k}"] = r_t2i
-
-        test_results["test/mean_R1"] = 0.5 * (
-            test_results["test/I2T_R1"] + test_results["test/T2I_R1"]
-        )
-
-        for metric_name, value in i2t_ranking.items():
-            test_results[f"test/I2T_{metric_name}"] = value
-        for metric_name, value in t2i_ranking.items():
-            test_results[f"test/T2I_{metric_name}"] = value
-
-        # MRR has the same first-positive interpretation in both directions.
-        # nDCG is normalized for the number of relevant candidates.
-        #
-        # Do not average mAP across directions:
-        # - I2T AP evaluates all relevant captions;
-        # - T2I AP equals reciprocal rank when each caption has one image.
-        for metric_name in ["MRR", "nDCG"]:
-            test_results[f"test/mean_{metric_name}"] = 0.5 * (
-                i2t_ranking[metric_name] + t2i_ranking[metric_name]
-            )
-
-        test_results["test/global_num_images"] = torch.tensor(
-            all_img.shape[0], device=self.device, dtype=torch.float32
-        )
-        test_results["test/global_num_texts"] = valid_text_mask_tensor.sum().float()
-
-        # 4. Log all metrics to WandB/Progress Bar
-        self.log_dict(
-            test_results, on_step=False, on_epoch=True, prog_bar=True, sync_dist=False
-        )
-
-        # 5. Update "Best" trackers (Usually tracked via R1)
-        is_new_best = False
-
-        if not self.trainer.sanity_checking:
-            current_i2t = test_results["test/I2T_R1"].detach()
-            current_t2i = test_results["test/T2I_R1"].detach()
-            current_mean = test_results["test/mean_R1"].detach()
-
-            self.test_i2t_r1_best(current_i2t)
-            self.test_t2i_r1_best(current_t2i)
-            self.test_mean_r1_best(current_mean)
-
-            best_i2t = self.test_i2t_r1_best.compute()
-            best_t2i = self.test_t2i_r1_best.compute()
-            best_mean = self.test_mean_r1_best.compute()
-
-            self.log("test/I2T_R1_best", best_i2t, sync_dist=False)
-            self.log("test/T2I_R1_best", best_t2i, sync_dist=False)
-            self.log("test/mean_R1_best", best_mean, sync_dist=False)
-
-            # True for a new best or an exact tie with the best.
-            is_new_best = bool(
-                torch.isclose(
-                    current_mean.float(), best_mean.float(), rtol=0.0, atol=1e-12
-                ).item()
-            )
-        # 6. Save visual results table
-        if (
-            self.trainer.is_global_zero
-            and not self.trainer.sanity_checking
-            and is_new_best
-        ):
-            self._save_retrieval_diagnostics(
-                sim_matrix=sim_matrix,
-                img_ids=all_img_ids,
-                txt_img_ids=all_txt_img_ids,
-                sample_ids=all_sample_ids,
-                group_ids=all_group_ids,
-                text_ids=all_text_ids,
-                text_group_ids=all_text_group_ids,
-                text_valid_mask=all_text_valid_mask,
-                metadata=all_image_metadata,
-                phase="test",
-                top_k=10,
-                max_queries_per_direction=15,
-            )
-            # self._save_misc_metrics(
-            #     sim_matrix, all_strings, all_img_ids, all_txt_img_ids, phase="test"
-            # )
-
-        # 7. Reset storage for the next epoch
-        self.test_outputs = {
-            "img_embs": [],
-            "txt_embs": [],
-            "img_ids": [],
-            "txt_img_ids": [],
-        }
+        self._on_retrieval_epoch_end("test")
 
     def setup(self, stage: str) -> None:
         """Lightning hook that is called at the beginning of fit (train + validate), validate,
@@ -1266,7 +1054,7 @@ class Mamba3LitModule(LightningModule):
     #     print("🔓 Intercepted state_dict load: Forcing strict=False to protect initialized vision weights.")
     #     return super().load_state_dict(state_dict, strict=False)
 
-    def configure_optimizers(self) -> Dict[str, Any]:
+    def configure_optimizers(self) -> dict[str, Any]:
         """Choose what optimizers and learning-rate schedulers to use in your optimization.
         Normally you'd need one. But in the case of GANs or similar you might have multiple.
 
@@ -1369,7 +1157,7 @@ class Mamba3LitModule(LightningModule):
             "TopK_Cosine_Scores",
             "Hardest_Negative_ID",
             "Hardest_Negative_Cosine",
-            "Top1_Correct"
+            "Top1_Correct",
         ]
 
         table = wandb.Table(columns=columns)
@@ -1436,7 +1224,7 @@ class Mamba3LitModule(LightningModule):
                 top_scores,
                 hardest_negative_id,
                 hardest_negative_score,
-                top1_correct
+                top1_correct,
             )
 
         # ------------------------------------------------------------------
@@ -1492,10 +1280,6 @@ class Mamba3LitModule(LightningModule):
 
             top1_correct = bool(positive_mask[ranked_indices[0]].item())
 
-            # Find metadata for this caption's owning image.
-            owner_positions = torch.nonzero(positive_mask, as_tuple=True)[0]
-            owner_position = int(owner_positions[0].item())
-
             table.add_data(
                 "T2I",
                 text_ids[text_position],
@@ -1506,7 +1290,7 @@ class Mamba3LitModule(LightningModule):
                 top_scores,
                 hardest_negative_id,
                 hardest_negative_score,
-                top1_correct
+                top1_correct,
             )
 
         self.logger.experiment.log({f"{phase}/retrieval_diagnostics": table})
@@ -1593,9 +1377,9 @@ class Mamba3LitModule(LightningModule):
 
     @staticmethod
     def _compute_ranking_metrics(
-        scores: torch.Tensor,
-        relevant: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+        scores: Tensor,
+        relevant: Tensor,
+    ) -> dict[str, Tensor]:
         """Compute binary-relevance ranking metrics for one direction."""
 
         if scores.ndim != 2 or relevant.ndim != 2:
@@ -1673,7 +1457,3 @@ class Mamba3LitModule(LightningModule):
             "mAP": average_precision.mean(),
             "nDCG": ndcg.mean(),
         }
-
-
-if __name__ == "__main__":
-    _ = Mamba3LitModule(None, None, None, None)
