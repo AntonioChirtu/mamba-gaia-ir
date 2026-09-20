@@ -1,0 +1,4 @@
+# configs/callbacks/efficiency.yaml
+
+efficiency:
+  _target_: src.callbacks.efficiency.EfficiencyCallback

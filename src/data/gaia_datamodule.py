@@ -15,6 +15,12 @@ from src.data.eval_collate import eval_collate_fn
 # Standard for many base Mamba models
 Image.MAX_IMAGE_PIXELS = None
 
+import json
+import numpy as np
+from transformers import AutoTokenizer, __version__ as transformers_version
+
+tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+
 
 class GAIADataset(Dataset):
     """Custom Dataset for GAIA Information Retrieval.
@@ -316,6 +322,88 @@ class GAIADataModule(LightningDataModule):
             self.hparams.max_length, is_training=False,
             max_captions=self.hparams.max_captions,
         )
+
+        self._analyze_token_lengths(train_records, val_records, test_records)
+
+
+    def _analyze_token_lengths(self, train_records, val_records, test_records):
+        import json
+        import numpy as np
+        from transformers import __version__ as transformers_version
+
+        def extract_captions(records):
+            captions = []
+
+            for record in records:
+                record_captions = record["captions"]
+
+                if isinstance(record_captions, str):
+                    # Handle a possible single-caption record.
+                    captions.append(record_captions)
+                else:
+                    captions.extend(record_captions)
+
+            return captions
+
+        # Replace `.captions` with the actual field used by your dataset class.
+        captions_by_split = {
+            "train": extract_captions(train_records),
+            "val": extract_captions(val_records),
+            "test": extract_captions(test_records),
+        }
+
+        for split, captions in captions_by_split.items():
+            print(
+                f"{split}: {len(captions)} captions "
+                f"from {len({
+                    'train': train_records,
+                    'val': val_records,
+                    'test': test_records,
+                }[split])} records"
+            )
+
+        def calculate(captions):
+            encoded = self.tokenizer(
+                captions,
+                add_special_tokens=True,  # must match __getitem__()
+                padding=False,
+                truncation=False,
+            )
+            lengths = np.asarray(
+                [len(ids) for ids in encoded["input_ids"]],
+                dtype=np.int64,
+            )
+
+            return {
+                "n": int(len(lengths)),
+                "fraction_gt_64": float(np.mean(lengths > 64)),
+                "fraction_gt_77": float(np.mean(lengths > 77)),
+                "fraction_gt_128": float(np.mean(lengths > 128)),
+                "p95": float(np.percentile(lengths, 95)),
+                "p99": float(np.percentile(lengths, 99)),
+                "maximum": int(lengths.max()),
+            }
+
+        results = {
+            split: calculate(captions)
+            for split, captions in captions_by_split.items()
+        }
+
+        all_captions = [
+            caption
+            for split_captions in captions_by_split.values()
+            for caption in split_captions
+        ]
+        results["all"] = calculate(all_captions)
+
+        results["metadata"] = {
+            "tokenizer": self.tokenizer.name_or_path,
+            "tokenizer_revision": self.tokenizer.init_kwargs.get("_commit_hash"),
+            "transformers_version": transformers_version,
+        }
+
+        print("\nUNTRUNCATED TOKEN-LENGTH DISTRIBUTION")
+        print(json.dumps(results, indent=2))    
 
 
     def train_dataloader(self) -> DataLoader:

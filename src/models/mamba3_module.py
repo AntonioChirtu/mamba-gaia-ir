@@ -1,4 +1,6 @@
 import gc
+import json
+import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -274,11 +276,7 @@ class Mamba3LitModule(LightningModule):
         self.val_batch_i2t_r1.reset()
         self.val_batch_t2i_r1.reset()
 
-    def model_step(
-        self,
-        batch: tuple[Tensor, Tensor, Tensor],
-        raw_texts=None,
-    ):
+    def model_step(self, batch: tuple[Tensor, Tensor, Tensor], raw_texts=None):
         """Perform a single model step on a batch of data.
 
         :param batch: A batch of data (a tuple) containing the input tensor of images and target labels.
@@ -328,9 +326,7 @@ class Mamba3LitModule(LightningModule):
         return loss, logits_i2t, logits_t2i, img_emb, txt_emb
 
     def training_step(
-        self,
-        batch: tuple[Tensor, Tensor, Tensor, list[str]],
-        batch_idx: int,
+        self, batch: tuple[Tensor, Tensor, Tensor, list[str]], batch_idx: int
     ) -> Tensor:
         """Perform a single training step on a batch of data from the training set.
 
@@ -396,9 +392,7 @@ class Mamba3LitModule(LightningModule):
             torch.cuda.empty_cache()
 
     def validation_step(
-        self,
-        batch: tuple[Tensor, Tensor, Tensor, Tensor, list[str]],
-        batch_idx: int,
+        self, batch: tuple[Tensor, Tensor, Tensor, Tensor, list[str]], batch_idx: int
     ) -> None:
         """Perform a single validation step on a batch of data from the validation set.
 
@@ -478,6 +472,9 @@ class Mamba3LitModule(LightningModule):
         )
 
         try:
+            self._synchronize_for_timing()
+            retrieval_started_at = time.perf_counter()
+
             gathered = self._gather_retrieval_outputs(outputs=outputs, phase=phase)
 
             # No rank produced outputs, e.g. an empty/special-purpose dataloader.
@@ -486,6 +483,40 @@ class Mamba3LitModule(LightningModule):
 
             data = self._evaluate_retrieval_epoch(
                 gathered=gathered, dataset=dataset, phase=phase
+            )
+
+            self._synchronize_for_timing()
+            local_retrieval_seconds = time.perf_counter() - retrieval_started_at
+
+            local_seconds_tensor = torch.tensor(
+                local_retrieval_seconds, device=self.device, dtype=torch.float64
+            )
+
+            # Every rank participates; use the slowest rank.
+            retrieval_seconds = self.trainer.strategy.reduce(
+                local_seconds_tensor, reduce_op="max"
+            )
+
+            num_image_queries = data.img_embs.shape[0]
+            num_text_queries = int(sum(data.text_valid_mask))
+            num_total_queries = num_image_queries + num_text_queries
+
+            queries_tensor = torch.tensor(
+                float(num_total_queries), device=self.device, dtype=torch.float64
+            )
+
+            retrieval_queries_per_second = queries_tensor / retrieval_seconds.clamp_min(
+                1e-12
+            )
+
+            data.metrics.update(
+                {
+                    f"perf/{phase}_retrieval_eval_seconds": (retrieval_seconds.float()),
+                    f"perf/{phase}_retrieval_queries_per_second": (
+                        retrieval_queries_per_second.float()
+                    ),
+                    f"perf/{phase}_retrieval_num_queries": (queries_tensor.float()),
+                }
             )
 
             self.log_dict(
@@ -500,6 +531,10 @@ class Mamba3LitModule(LightningModule):
             if phase == "val":
                 is_new_best = self._update_validation_best_metrics(data.metrics)
                 self._log_validation_batch_metrics()
+
+            # Persist complete test embeddings once, on global rank zero.
+            if phase == "test" and self.trainer.is_global_zero:
+                self._save_retrieval_embeddings_artifact(data=data, phase=phase)
 
             should_save_diagnostics = (
                 self.trainer.is_global_zero
@@ -752,6 +787,29 @@ class Mamba3LitModule(LightningModule):
         )
         metrics[f"{phase}/global_num_texts"] = valid_text_mask_tensor.sum().float()
 
+        num_image_queries = int(i2t_scores.shape[0])
+        num_text_queries = int(t2i_scores.shape[0])
+        num_total_queries = num_image_queries + num_text_queries
+
+        metrics[f"perf/{phase}_num_image_gallery_items"] = torch.tensor(
+            i2t_scores.shape[0], device=self.device, dtype=torch.float64
+        )
+        metrics[f"perf/{phase}_num_text_gallery_items"] = torch.tensor(
+            i2t_scores.shape[1], device=self.device, dtype=torch.float64
+        )
+        metrics[f"perf/{phase}_similarity_matrix_elements"] = torch.tensor(
+            sim_matrix.numel(), device=self.device, dtype=torch.float64
+        )
+        metrics[f"perf/{phase}_retrieval_num_image_queries"] = torch.tensor(
+            num_image_queries, device=self.device, dtype=torch.float64
+        )
+        metrics[f"perf/{phase}_retrieval_num_text_queries"] = torch.tensor(
+            num_text_queries, device=self.device, dtype=torch.float64
+        )
+        metrics[f"perf/{phase}_retrieval_num_queries"] = torch.tensor(
+            num_total_queries, device=self.device, dtype=torch.float64
+        )
+
         return RetrievalEpochData(
             img_embs=all_img,
             txt_embs=all_txt,
@@ -885,6 +943,14 @@ class Mamba3LitModule(LightningModule):
                 i2t_ranking[metric_name] + t2i_ranking[metric_name]
             )
 
+        results[f"{phase}/rSum"] = sum(
+            results[f"{phase}/{direction}_R{k}"]
+            for direction in ("I2T", "T2I")
+            for k in (1, 5, 10)
+        )
+
+        results[f"{phase}/mean_recall"] = results[f"{phase}/rSum"] / 6.0
+
         return results
 
     def _update_validation_best_metrics(self, metrics: dict[str, Tensor]) -> bool:
@@ -929,6 +995,91 @@ class Mamba3LitModule(LightningModule):
             prog_bar=False,
             sync_dist=True,
         )
+
+    def _save_retrieval_embeddings_artifact(
+        self, data: RetrievalEpochData, phase: RetrievalPhase
+    ) -> None:
+        """Save gathered retrieval embeddings and their IDs as a W&B Artifact."""
+
+        if not self.trainer.is_global_zero:
+            return
+
+        if not isinstance(self.logger, WandbLogger):
+            return
+
+        run = self.logger.experiment
+
+        valid_text_mask = torch.as_tensor(
+            data.text_valid_mask,
+            dtype=torch.bool,
+        )
+
+        tensor_payload = {
+            # These embeddings are already L2-normalized.
+            "image_embeddings": data.img_embs.detach().float().cpu(),
+            "text_embeddings": data.txt_embs.detach().float().cpu(),
+            "image_dataset_ids": data.img_ids.detach().long().cpu(),
+            "text_parent_dataset_ids": data.txt_img_ids.detach().long().cpu(),
+            "text_valid_mask": valid_text_mask.cpu(),
+        }
+
+        index_payload = {
+            "schema_version": 1,
+            "phase": phase,
+            "run_id": run.id,
+            "sample_ids": data.sample_ids,
+            "group_ids": data.group_ids,
+            "text_ids": data.text_ids,
+            "text_group_ids": data.text_group_ids,
+            "embedding_dimension": int(data.img_embs.shape[1]),
+            "num_images": int(data.img_embs.shape[0]),
+            "num_texts_total": int(data.txt_embs.shape[0]),
+            "num_texts_valid": int(valid_text_mask.sum().item()),
+            "embeddings_are_l2_normalized": True,
+        }
+
+        artifact = wandb.Artifact(
+            name="retrieval-embeddings",
+            type="evaluation",
+            description=(
+                "Global image and text retrieval embeddings with stable IDs, "
+                "gathered after DDP deduplication."
+            ),
+            metadata={
+                "phase": phase,
+                "source_run_id": run.id,
+                "embedding_dimension": int(data.img_embs.shape[1]),
+                "num_images": int(data.img_embs.shape[0]),
+                "num_texts_total": int(data.txt_embs.shape[0]),
+                "num_texts_valid": int(valid_text_mask.sum().item()),
+                "embeddings_are_l2_normalized": True,
+            },
+        )
+
+        # Artifact.new_file creates a temporary file and adds it to the Artifact.
+        with artifact.new_file("embeddings.pt", mode="wb") as file:
+            torch.save(tensor_payload, file)
+
+        with artifact.new_file(
+            "index.json",
+            mode="w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(index_payload, file, ensure_ascii=False, indent=2)
+
+        run.log_artifact(
+            artifact,
+            aliases=[
+                "latest",
+                f"{phase}-latest",
+                f"{phase}-run-{run.id}",
+            ],
+        )
+
+    @staticmethod
+    def _synchronize_for_timing() -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     @staticmethod
     def _empty_retrieval_outputs() -> dict[str, list[Tensor]]:
@@ -1376,10 +1527,7 @@ class Mamba3LitModule(LightningModule):
         self.logger.experiment.log({f"{phase}/predictions_detailed": table})
 
     @staticmethod
-    def _compute_ranking_metrics(
-        scores: Tensor,
-        relevant: Tensor,
-    ) -> dict[str, Tensor]:
+    def _compute_ranking_metrics(scores: Tensor, relevant: Tensor) -> dict[str, Tensor]:
         """Compute binary-relevance ranking metrics for one direction."""
 
         if scores.ndim != 2 or relevant.ndim != 2:
