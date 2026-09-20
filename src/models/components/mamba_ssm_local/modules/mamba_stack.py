@@ -1,11 +1,11 @@
 from functools import partial
 
-from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.ops.triton.layer_norm import RMSNorm
 from torch import nn
 
 from src.models.components.mamba_ssm_local.models.mixer_seq_simple import _init_weights
 from src.models.components.mamba_ssm_local.modules.block import Block
+from src.models.components.mamba_ssm_local.modules.mamba2 import Mamba2
 from src.models.components.mamba_ssm_local.modules.mamba3 import Mamba3
 from src.models.components.mamba_ssm_local.modules.mixer_stack import run_mixer_layers
 
