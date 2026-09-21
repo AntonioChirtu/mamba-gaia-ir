@@ -39,6 +39,7 @@ class MambaStack(nn.Module):
         dropout=0.0,
         d_intermediate=0,
         apply_init_weights=True,
+        unfreeze_last_n_blocks=None,
         **layer_kwargs,
     ):
         super().__init__()
@@ -76,6 +77,21 @@ class MambaStack(nn.Module):
 
         if apply_init_weights:
             self.apply(partial(_init_weights, n_layer=n_layers))
+
+        if unfreeze_last_n_blocks is not None:
+            self._apply_freeze_policy(unfreeze_last_n_blocks)
+
+    def _apply_freeze_policy(self, unfreeze_last_n_blocks: int) -> None:
+        for param in self.layers.parameters():
+            param.requires_grad = False
+
+        if unfreeze_last_n_blocks > 0:
+            for block in list(self.layers)[-unfreeze_last_n_blocks:]:
+                for param in block.parameters():
+                    param.requires_grad = True
+
+        for param in self.norm_f.parameters():
+            param.requires_grad = True
 
     def forward(self, x, **kwargs):
         hidden = run_mixer_layers(self.layers, x, dropout=self.dropout, **kwargs)

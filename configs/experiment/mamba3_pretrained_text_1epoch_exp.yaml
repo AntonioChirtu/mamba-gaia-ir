@@ -8,3 +8,7 @@ defaults:
 trainer:
   min_epochs: 1
   max_epochs: 1
+
+model:
+  text_net:
+    unfreeze_last_n_blocks: 0

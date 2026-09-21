@@ -1,3 +1,4 @@
 _target_: src.models.components.mamba_ssm_local.modules.mamba_stack.MambaStack.from_pretrained
 pretrained_model_name: state-spaces/mamba3-siso-187m
+tokenizer_name: meta-llama/llama-3.1-8B
 dropout: 0.2
