@@ -1,0 +1,27 @@
+model:
+  dual_encoder:
+    _target_: src.models.components.clip_dual_encoder.CLIPPretrainedDualEncoder
+    model_name: ViT-B-32
+    pretrained: openai
+    unfreeze_last_n_visual_blocks: 0
+    unfreeze_last_n_text_blocks: 0
+    fully_unfreeze_visual: false
+    fully_unfreeze_text: false
+    train_projection_heads: true
+    train_logit_scale: true
+
+  image_net: null
+  text_net: null
+
+
+# # Partial fine-tuning
+# unfreeze_last_n_visual_blocks: 2
+# unfreeze_last_n_text_blocks: 4
+# fully_unfreeze_visual: false
+# fully_unfreeze_text: false
+
+# # Full fine-tuning
+# fully_unfreeze_visual: true
+# fully_unfreeze_text: true
+# train_projection_heads: true
+# train_logit_scale: true

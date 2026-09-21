@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import wandb
 from lightning import LightningModule
 from lightning.pytorch.loggers import WandbLogger
-from torch import Tensor
+from torch import Tensor, nn
 from torchmetrics import MaxMetric, MeanMetric
 
 
@@ -143,6 +143,7 @@ class Mamba3LitModule(LightningModule):
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
         compile: bool,
+        dual_encoder = None,
         patch_size: int = 16,
         vocab_size: int = 50277,
         logit_scale_init: float = 0.07,
@@ -167,6 +168,24 @@ class Mamba3LitModule(LightningModule):
 
         self.image_model = image_net
         self.text_model = text_net
+        self.dual_encoder = dual_encoder
+
+        if self.dual_encoder is not None:
+            if self.image_model is not None or self.text_model is not None:
+                raise ValueError(
+                    "dual_encoder cannot be combined with image_model/text_model."
+                )
+
+            self.image_model = None
+            self.text_model = None
+
+            # Do not create unused trainable projection layers.
+            self.proj1 = nn.Identity()
+            self.proj2 = nn.Identity()
+
+        else:
+            self.image_model = image_net
+            self.text_model = text_net
 
         # 1. Vision "Patch" Embedding: Turns [B, 3, 224, 224] -> [B, 196, d_model]
         self.patch_embed = torch.nn.Conv2d(
@@ -222,6 +241,19 @@ class Mamba3LitModule(LightningModule):
             `self.text_model.encodes_raw_text` is set.
         :return: A tensor of logits.
         """
+        if self.dual_encoder is not None:
+            if modality == "image":
+                return self.dual_encoder.encode_images(x)
+
+            if modality == "text":
+                if raw_texts is None:
+                    raise ValueError(
+                        "raw_texts is required for the full CLIP text encoder."
+                    )
+                return self.dual_encoder.encode_texts(raw_texts)
+
+            raise ValueError(f"Unsupported modality: {modality!r}")
+
         if modality == "image":
             # Pretrained vision wrapper or ViT-only model; expects [B, 3, 224, 224]
             if hasattr(self.image_model, "vision_encoder") or hasattr(
@@ -305,7 +337,11 @@ class Mamba3LitModule(LightningModule):
             self.logit_scale.clamp_(max=4.6052)
 
         # Scaling by temperature
-        scale = self.logit_scale.exp().clamp(max=100)
+        if self.dual_encoder is not None:
+            scale = self.dual_encoder.logit_scale
+        else:
+            scale = self.logit_scale.exp().clamp(max=100)
+
         logits_i2t = (img_emb @ txt_emb.t()) * scale
         logits_t2i = logits_i2t.t()
 
