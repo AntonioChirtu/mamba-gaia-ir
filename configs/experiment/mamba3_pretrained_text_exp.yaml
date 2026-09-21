@@ -1,0 +1,25 @@
+# @package _global_
+
+# Run: python src/train.py experiment=mamba3_pretrained_text_exp
+# Mamba3 arm of the Mamba3-vs-CLIP comparison: same ViT-B/32 image tower as
+# clip_pretrained_text_exp, pretrained Mamba3 (state-spaces/mamba3-siso-187m)
+# as the text tower instead of CLIP's pretrained text transformer.
+
+defaults:
+  - override /data: gaia
+  - override /model: mamba3
+  - override /model/text_net: mamba3_pretrained
+  - override /callbacks: default
+  - override /trainer: default
+
+tags: ["gaia", "mamba3_pretrained_text"]
+
+seed: 12345
+
+trainer:
+  min_epochs: 10
+  max_epochs: 100
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: "norm"
+  precision: bf16-mixed
+  accumulate_grad_batches: 4

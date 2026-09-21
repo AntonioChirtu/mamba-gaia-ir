@@ -5,7 +5,7 @@ defaults:
   - _self_
   - data: gaia # choose datamodule with `test_dataloader()` for evaluation
   - model: mamba3
-  - logger: null
+  - logger: wandb
   - trainer: default
   - paths: default
   - extras: default
