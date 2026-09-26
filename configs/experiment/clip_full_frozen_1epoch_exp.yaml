@@ -1,0 +1,10 @@
+# @package _global_
+# Run: python src/train.py experiment=clip_full_frozen_1epoch_exp
+
+defaults:
+  - clip_full_frozen
+  - _self_
+
+trainer:
+  min_epochs: 1
+  max_epochs: 1

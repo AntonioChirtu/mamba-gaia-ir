@@ -143,7 +143,7 @@ class Mamba3LitModule(LightningModule):
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
         compile: bool,
-        dual_encoder = None,
+        dual_encoder=None,
         patch_size: int = 16,
         vocab_size: int = 50277,
         logit_scale_init: float = 0.07,
@@ -164,7 +164,9 @@ class Mamba3LitModule(LightningModule):
 
         # this line allows to access init params with 'self.hparams' attribute
         # also ensures init params will be stored in ckpt
-        self.save_hyperparameters(logger=False, ignore=["image_net", "text_net"])
+        self.save_hyperparameters(
+            logger=False, ignore=["image_net", "text_net", "dual_encoder"]
+        )
 
         self.image_model = image_net
         self.text_model = text_net
@@ -187,20 +189,21 @@ class Mamba3LitModule(LightningModule):
             self.image_model = image_net
             self.text_model = text_net
 
-        # 1. Vision "Patch" Embedding: Turns [B, 3, 224, 224] -> [B, 196, d_model]
-        self.patch_embed = torch.nn.Conv2d(
-            3, image_net.d_model, kernel_size=patch_size, stride=patch_size
-        )
+        if self.dual_encoder is None:
+            # 1. Vision "Patch" Embedding: Turns [B, 3, 224, 224] -> [B, 196, d_model]
+            self.patch_embed = torch.nn.Conv2d(
+                3, image_net.d_model, kernel_size=patch_size, stride=patch_size
+            )
 
-        # 2. Text Embedding: Turns [B, 77] -> [B, 77, d_model]
-        self.text_embed = torch.nn.Embedding(vocab_size, text_net.d_model)
+            # 2. Text Embedding: Turns [B, 77] -> [B, 77, d_model]
+            self.text_embed = torch.nn.Embedding(vocab_size, text_net.d_model)
 
-        self.proj1 = (
-            torch.nn.Identity()
-            if image_net.d_model == 512
-            else torch.nn.Linear(image_net.d_model, 512)
-        )
-        self.proj2 = torch.nn.Linear(text_net.d_model, 512)
+            self.proj1 = (
+                torch.nn.Identity()
+                if image_net.d_model == 512
+                else torch.nn.Linear(image_net.d_model, 512)
+            )
+            self.proj2 = torch.nn.Linear(text_net.d_model, 512)
 
         self.logit_scale = torch.nn.Parameter(
             torch.ones([]) * torch.log(torch.tensor(1 / logit_scale_init))
@@ -1208,7 +1211,8 @@ class Mamba3LitModule(LightningModule):
         # --- DYNAMIC VOCABSIZE AUTO-PATCH ---
         # Look across to see if a trainer and a datamodule with a tokenizer exist
         if (
-            stage == "fit"
+            self.dual_encoder is None
+            and stage == "fit"
             and self.trainer
             and hasattr(self.trainer, "datamodule")
             and hasattr(self.trainer.datamodule, "tokenizer")
@@ -1229,9 +1233,11 @@ class Mamba3LitModule(LightningModule):
                     actual_vocab_size, self.text_embed.embedding_dim
                 )
 
-        if self.hparams.compile and stage == "fit":
+        if self.dual_encoder is None and self.hparams.compile and stage == "fit":
             self.image_model = torch.compile(self.image_model)
             self.text_model = torch.compile(self.text_model)
+        elif self.dual_encoder is not None and self.hparams.compile and stage == "fit":
+            self.dual_encoder = torch.compile(self.dual_encoder)
 
     # def load_state_dict(self, state_dict, strict: bool = True):
     #     """
