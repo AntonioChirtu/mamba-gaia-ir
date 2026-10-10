@@ -156,17 +156,6 @@ class RSITMDDataset(Dataset):
                     caption = sentence_obj["raw"]
                     self.data_pairs.append((full_img_path, caption))
 
-        # Construct this once, after collecting every pair.
-        unique_image_paths = sorted({
-            path
-            for path, _ in self.data_pairs
-        })
-
-        self.image_to_id = {
-            path: numeric_id
-            for numeric_id, path in enumerate(unique_image_paths)
-        } 
-
         if not self.data_pairs:
             raise ValueError(
                 f"No samples found for split={split!r}. Check the 'split' values in {metadata_path}."
@@ -177,6 +166,11 @@ class RSITMDDataset(Dataset):
             grouped.setdefault(path, []).append(caption)
         self.records: List[Tuple[str, List[str]]] = list(grouped.items())
 
+        # Retrieval image IDs must match dataset record indices.
+        self.image_to_id = {
+            path: idx for idx, (path, _) in enumerate(self.records)
+        }
+
         self.is_training = not self.is_eval
 
         print(
@@ -186,6 +180,27 @@ class RSITMDDataset(Dataset):
 
     def __len__(self):
         return len(self.records)
+
+    def get_retrieval_metadata(self, idx: int) -> Dict[str, Any]:
+        img_path, captions = self.records[idx]
+        relative_path = Path(img_path).relative_to(
+            Path(self.root_dir)
+        ).as_posix()
+        sample_id = f"rsitmd:image:{relative_path}"
+        num_valid = min(len(captions), self.max_captions)
+
+        return {
+            "dataset_index": idx,
+            "sample_id": sample_id,
+            "group_id": sample_id,
+            "text_ids": [
+                f"{sample_id}:caption:{i}" for i in range(num_valid)
+            ],
+            "captions": list(captions[:num_valid]),
+            "num_valid_captions": num_valid,
+            "image_alt": captions[0] if captions else "",
+            "image_path": img_path,
+        }
 
     def set_train(self, mode: bool):
         self.is_training = mode
@@ -357,6 +372,11 @@ class RSITMDDataModule(LightningDataModule):
                 "test",
                 self.data_val.data_pairs,
             )
+
+            if train_test["image_overlap"] or train_test["pair_overlap"]:
+                raise RuntimeError(
+                    "RSITMD train/held-out image or pair overlap detected."
+                )
 
             for caption in train_test["caption_overlap"][:20]:
                 print(repr(caption))
