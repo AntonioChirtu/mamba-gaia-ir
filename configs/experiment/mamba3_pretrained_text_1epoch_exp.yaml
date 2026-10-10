@@ -12,3 +12,5 @@ trainer:
 model:
   text_net:
     unfreeze_last_n_blocks: 0
+  image_net:
+    freeze_backbone: true

@@ -1,0 +1,49 @@
+# configs/model/lit_mamba_openclip.yaml
+
+_target_: src.models.lit_module.LiTLitModule
+
+compile: false
+vocab_size: 50277
+text_pooling: mean
+
+# This is a temperature, not log-temperature.
+temperature_init: 0.07
+max_logit_scale: 100.0
+
+# Use val/loss unless your existing retrieval evaluator logs val/mean_R1.
+scheduler_monitor: val/mean_R1
+
+image_net:
+  _target_: src.models.components.LiTMamba.LockedOpenCLIPImageEncoder
+  model_name: ViT-B-32
+  pretrained: openai
+  normalize: true
+
+text_net:
+  _target_: src.models.components.mamba_ssm_local.modules.mamba_stack.MambaStack
+  layer: Mamba3
+  n_layers: 1
+  d_model: 768
+  d_state: 64
+  d_conv: 4
+  expand: 2
+  headdim: 16
+  dropout: 0.1
+  apply_init_weights: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.00018
+  weight_decay: 0.01
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+  _partial_: true
+  mode: max
+  factor: 0.3
+  patience: 2
+  threshold: 0.0001
+  threshold_mode: rel
+  cooldown: 0
+  min_lr: 0.000001

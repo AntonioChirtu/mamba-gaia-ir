@@ -1,0 +1,79 @@
+# @package _global_
+
+defaults:
+  - override /data: gaia
+  - override /model: lit_mamba_openclip
+  - override /callbacks: default
+  - override /trainer: gpu
+  - override /logger: wandb
+
+task_name: train
+
+tags:
+  - lit
+  - openclip
+  - frozen-image
+  - mamba3
+  - gaia
+
+train: true
+test: true
+ckpt_path: null
+seed: 12345
+
+data:
+  batch_size: 128
+  num_workers: 4
+  pin_memory: true
+  max_length: 128
+  max_captions: 5
+
+  # Must exactly match model.image_net.
+  clip_model_name: ViT-B-32
+  clip_pretrained: openai
+  image_transform_mode: openclip
+
+model:
+  # Use this only if your original full-gallery retrieval evaluator remains
+  # in the Lightning module and logs val/mean_R1 every epoch.
+  scheduler_monitor: val/mean_R1
+
+  image_net:
+    model_name: ViT-B-32
+    pretrained: openai
+    normalize: true
+
+  text_net:
+    n_layers: 1
+    d_model: 768
+    d_state: 64
+    d_conv: 4
+    expand: 2
+    headdim: 16
+    dropout: 0.1
+    apply_init_weights: false
+
+  optimizer:
+    lr: 0.00018
+    weight_decay: 0.01
+
+  scheduler:
+    mode: max
+    factor: 0.3
+    patience: 2
+    threshold: 0.0001
+    threshold_mode: rel
+    cooldown: 0
+    min_lr: 0.000001
+
+logger:
+  wandb:
+    entity: mihail-chirtu-polytechnica-university-of-bucharest
+    project: lightning-hydra-template
+    name: lit-openclip-vit-b32-mamba1
+    group: lit-openclip-ablation
+    tags:
+      - lit
+      - openclip-vit-b32
+      - image-fully-frozen
+      - mamba3-depth1

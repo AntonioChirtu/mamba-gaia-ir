@@ -1,0 +1,47 @@
+command:
+- ${env}
+- bash
+- -lc
+- "profile=\"$1\";\nlayers=1; lr=0.00015; wd=0.05; dropout=0.20; scheduler_patience=5; scheduler_factor=0.1;\ncase \"$profile\"\
+  \ in\n  l8_01)\n    lr=0.00012; wd=0.01; dropout=0.10;\n    scheduler_patience=5; scheduler_factor=0.1\n    ;;\n  l8_02)\n\
+  \    lr=0.00012; wd=0.01; dropout=0.30;\n    scheduler_patience=2; scheduler_factor=0.3\n    ;;\n  l8_03)\n    lr=0.00012;\
+  \ wd=0.10; dropout=0.10;\n    scheduler_patience=2; scheduler_factor=0.3\n    ;;\n  l8_04)\n    lr=0.00012; wd=0.10; dropout=0.30;\n\
+  \    scheduler_patience=5; scheduler_factor=0.1\n    ;;\n  l8_05)\n    lr=0.00018; wd=0.01; dropout=0.10;\n    scheduler_patience=2;\
+  \ scheduler_factor=0.3\n    ;;\n  l8_06)\n    lr=0.00018; wd=0.01; dropout=0.30;\n    scheduler_patience=5; scheduler_factor=0.1\n\
+  \    ;;\n  l8_07)\n    lr=0.00018; wd=0.10; dropout=0.10;\n    scheduler_patience=5; scheduler_factor=0.1\n    ;;\n  l8_08)\n\
+  \    lr=0.00018; wd=0.10; dropout=0.30;\n    scheduler_patience=2; scheduler_factor=0.3\n    ;;\n  depth2_center)\n    layers=2;\
+  \ lr=0.00015; wd=0.05; dropout=0.20;\n    scheduler_patience=5; scheduler_factor=0.1\n    ;;\n  depth4_center)\n    layers=4;\
+  \ lr=0.00015; wd=0.05; dropout=0.20;\n    scheduler_patience=5; scheduler_factor=0.1\n    ;;\n  depth4_low_lr)\n    layers=4;\
+  \ lr=0.00010; wd=0.05; dropout=0.20;\n    scheduler_patience=5; scheduler_factor=0.1\n    ;;\n  depth6_low_lr)\n    layers=6;\
+  \ lr=0.00010; wd=0.05; dropout=0.20;\n    scheduler_patience=5; scheduler_factor=0.1\n    ;;\n  *)\n    echo \"Unknown profile:\
+  \ $profile\" >&2;\n    exit 2\n    ;;\nesac;\ntext_override=\"model.text_net={_target_:src.models.components.mamba_ssm_local.modules.mamba_stack.MambaStack,apply_init_weights:false,d_conv:4,d_model:768,d_state:64,dropout:$dropout,expand:2,headdim:16,layer:Mamba3,n_layers:$layers}\"\
+  ;\nexec python src/train.py \"experiment=gaia_full_exp\" \"seed=12345\" \"trainer.min_epochs=10\" \"trainer.max_epochs=50\"\
+  \ \"trainer.accumulate_grad_batches=4\" \"data.batch_size=128\" \"callbacks.early_stopping.monitor=val/mean_R1\" \"callbacks.early_stopping.mode=max\"\
+  \ \"callbacks.early_stopping.patience=100\" \"callbacks.early_stopping.min_delta=0\" \"model.optimizer.lr=$lr\" \"model.optimizer.weight_decay=$wd\"\
+  \ \"model.scheduler.patience=$scheduler_patience\" \"model.scheduler.factor=$scheduler_factor\" \"$text_override\""
+- sweep-profile
+- ${profile}
+description: Twelve-run GAIA study for residual/prenorm/RMSNorm Mamba3. Eight L8 optimizer/regularization screening trials
+  at one layer, center depth trials at two and four layers, plus lower-LR four- and six-layer depth probes.
+method: grid
+metric:
+  goal: maximize
+  name: val/mean_R1_best
+name: mamba3-resnorm-12run-screen-fixed
+parameters:
+  profile:
+    values:
+    - l8_01
+    - l8_02
+    - l8_03
+    - l8_04
+    - l8_05
+    - l8_06
+    - l8_07
+    - l8_08
+    - depth2_center
+    - depth4_center
+    - depth4_low_lr
+    - depth6_low_lr
+program: src/train.py
+run_cap: 12

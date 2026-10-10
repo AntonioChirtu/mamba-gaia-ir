@@ -1,0 +1,36 @@
+# pretrained_text_freeze_multiseed.yaml
+
+name: pretrained-text-freeze-multiseed
+description: >
+  Two additional seeds for Mamba3/CLIP pretrained text towers,
+  with the custom ViT frozen and unfrozen.
+
+entity: mihail-chirtu-polytechnica-university-of-bucharest
+project: lightning-hydra-template
+
+program: src/train.py
+method: grid
+run_cap: 8
+
+parameters:
+  experiment:
+    values:
+      - mamba3_pretrained_text_1epoch_exp
+      - clip_pretrained_text_1epoch_exp
+
+  model.image_net.freeze_backbone:
+    values:
+      - false
+      - true
+
+  seed:
+    values:
+      - 42
+      - 2026
+
+# Hydra expects key=value arguments rather than --key=value.
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args_no_hyphens}

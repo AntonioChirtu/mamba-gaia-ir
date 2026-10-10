@@ -1,0 +1,281 @@
+name: gaia-text-encoder-3arch-20run-v2
+description: >-
+  Twenty-run prospective GAIA text-encoder study comparing initialized
+  residual/prenorm/RMSNorm Mamba3, bidirectional Transformer, and BiLSTM.
+  Mamba2 is excluded because it requires a separate Python environment and
+  remains an existing fixed one-layer reference. The common-environment sweep
+  covers depth, learning rate, dropout, and selected depth-hyperparameter
+  interactions. All runs use the same data, seed, batch size, gradient
+  accumulation, optimizer family, validation objective, and 50-epoch maximum
+  budget. Text-encoder configurations are removed and replaced rather than
+  merged to support Hydra structured configs.
+
+program: src/train.py
+method: grid
+run_cap: 20
+
+metric:
+  name: val/mean_R1_best
+  goal: maximize
+
+parameters:
+  profile:
+    values:
+      # Mamba3: seven trials
+      - mamba3_depth2_responsive
+      - mamba3_depth4_responsive
+      - mamba3_depth4_high_lr
+      - mamba3_depth4_low_dropout
+      - mamba3_depth4_high_lr_low_dropout
+      - mamba3_depth2_high_lr
+      - mamba3_depth2_low_dropout
+
+      # Bidirectional Transformer: seven trials
+      - transformer_depth2_responsive
+      - transformer_depth4_responsive
+      - transformer_depth4_high_lr
+      - transformer_depth4_low_dropout
+      - transformer_depth4_high_lr_low_dropout
+      - transformer_depth2_high_lr
+      - transformer_depth2_low_dropout
+
+      # BiLSTM: six trials
+      - bilstm_depth2_responsive
+      - bilstm_depth3_responsive
+      - bilstm_depth2_high_lr
+      - bilstm_depth2_low_dropout
+      - bilstm_depth2_high_lr_low_dropout
+      - bilstm_depth3_high_lr_low_dropout
+
+command:
+  - ${env}
+  - bash
+  - -lc
+  - |
+      set -euo pipefail
+
+      profile_arg="${1:?missing sweep profile argument}"
+
+      case "$profile_arg" in
+        profile=*)
+          profile="${profile_arg#profile=}"
+          ;;
+        *)
+          echo "Invalid sweep argument: $profile_arg" >&2
+          exit 2
+          ;;
+      esac
+
+      architecture=""
+      layers=1
+
+      # Shared center recipe.
+      lr=0.00015
+      wd=0.05
+      dropout=0.20
+
+      # Responsive scheduler selected from the previous screen.
+      scheduler_patience=2
+      scheduler_factor=0.3
+
+      case "$profile" in
+        # ---------------------------------------------------------------
+        # Mamba3
+        # ---------------------------------------------------------------
+        mamba3_depth2_responsive)
+          architecture=mamba3
+          layers=2
+          ;;
+
+        mamba3_depth4_responsive)
+          architecture=mamba3
+          layers=4
+          ;;
+
+        mamba3_depth4_high_lr)
+          architecture=mamba3
+          layers=4
+          lr=0.00018
+          ;;
+
+        mamba3_depth4_low_dropout)
+          architecture=mamba3
+          layers=4
+          dropout=0.10
+          ;;
+
+        mamba3_depth4_high_lr_low_dropout)
+          architecture=mamba3
+          layers=4
+          lr=0.00018
+          dropout=0.10
+          ;;
+
+        mamba3_depth2_high_lr)
+          architecture=mamba3
+          layers=2
+          lr=0.00018
+          ;;
+
+        mamba3_depth2_low_dropout)
+          architecture=mamba3
+          layers=2
+          dropout=0.10
+          ;;
+
+        # ---------------------------------------------------------------
+        # Bidirectional Transformer
+        # ---------------------------------------------------------------
+        transformer_depth2_responsive)
+          architecture=transformer
+          layers=2
+          ;;
+
+        transformer_depth4_responsive)
+          architecture=transformer
+          layers=4
+          ;;
+
+        transformer_depth4_high_lr)
+          architecture=transformer
+          layers=4
+          lr=0.00018
+          ;;
+
+        transformer_depth4_low_dropout)
+          architecture=transformer
+          layers=4
+          dropout=0.10
+          ;;
+
+        transformer_depth4_high_lr_low_dropout)
+          architecture=transformer
+          layers=4
+          lr=0.00018
+          dropout=0.10
+          ;;
+
+        transformer_depth2_high_lr)
+          architecture=transformer
+          layers=2
+          lr=0.00018
+          ;;
+
+        transformer_depth2_low_dropout)
+          architecture=transformer
+          layers=2
+          dropout=0.10
+          ;;
+
+        # ---------------------------------------------------------------
+        # BiLSTM
+        # ---------------------------------------------------------------
+        bilstm_depth2_responsive)
+          architecture=bilstm
+          layers=2
+          ;;
+
+        bilstm_depth3_responsive)
+          architecture=bilstm
+          layers=3
+          ;;
+
+        bilstm_depth2_high_lr)
+          architecture=bilstm
+          layers=2
+          lr=0.00018
+          ;;
+
+        bilstm_depth2_low_dropout)
+          architecture=bilstm
+          layers=2
+          dropout=0.10
+          ;;
+
+        bilstm_depth2_high_lr_low_dropout)
+          architecture=bilstm
+          layers=2
+          lr=0.00018
+          dropout=0.10
+          ;;
+
+        bilstm_depth3_high_lr_low_dropout)
+          architecture=bilstm
+          layers=3
+          lr=0.00018
+          dropout=0.10
+          ;;
+
+        *)
+          echo "Unknown sweep profile: $profile" >&2
+          exit 2
+          ;;
+      esac
+
+      # Hydra structured dictionaries merge by default. Remove the current
+      # text_net node and add a clean architecture-specific dictionary.
+      text_overrides=()
+
+      case "$architecture" in
+        mamba3)
+          text_overrides=(
+            '~model.text_net'
+            "+model.text_net={_target_:src.models.components.mamba_ssm_local.modules.mamba_stack.MambaStack,apply_init_weights:true,d_conv:4,d_model:768,d_state:64,dropout:$dropout,expand:2,headdim:16,layer:Mamba3,n_layers:$layers}"
+          )
+          ;;
+
+        transformer)
+          text_overrides=(
+            '~model.text_net'
+            "+model.text_net={_target_:src.models.components.text_encoders.BidirectionalTransformerTextEncoder,d_model:768,dim_feedforward:768,dropout:$dropout,max_len:\${data.max_length},n_layers:$layers,nhead:8}"
+          )
+          ;;
+
+        bilstm)
+          text_overrides=(
+            '~model.text_net'
+            "+model.text_net={_target_:src.models.components.text_encoders.BiLSTMTextEncoder,d_model:768,dropout:$dropout,n_layers:$layers}"
+          )
+          ;;
+
+        *)
+          echo "Unknown architecture: $architecture" >&2
+          exit 2
+          ;;
+      esac
+
+      echo "Starting profile=$profile"
+      echo "architecture=$architecture"
+      echo "layers=$layers"
+      echo "lr=$lr"
+      echo "weight_decay=$wd"
+      echo "dropout=$dropout"
+      echo "scheduler_patience=$scheduler_patience"
+      echo "scheduler_factor=$scheduler_factor"
+
+      exec python src/train.py \
+        "experiment=gaia_full_exp" \
+        "seed=12345" \
+        "trainer.min_epochs=10" \
+        "trainer.max_epochs=50" \
+        "trainer.accumulate_grad_batches=4" \
+        "data.batch_size=128" \
+        "callbacks.early_stopping.monitor=val/mean_R1" \
+        "callbacks.early_stopping.mode=max" \
+        "callbacks.early_stopping.patience=100" \
+        "callbacks.early_stopping.min_delta=0" \
+        "model.optimizer.lr=$lr" \
+        "model.optimizer.weight_decay=$wd" \
+        "model.scheduler.patience=$scheduler_patience" \
+        "model.scheduler.factor=$scheduler_factor" \
+        "++architecture=$architecture" \
+        "++n_layers=$layers" \
+        "++learning_rate=$lr" \
+        "++weight_decay=$wd" \
+        "++text_dropout=$dropout" \
+        "++scheduler_patience=$scheduler_patience" \
+        "++scheduler_factor=$scheduler_factor" \
+        "++search_stage=three_arch_hparam_20run_v2" \
+        "${text_overrides[@]}"
+  - sweep-profile
+  - ${args_no_hyphens}
