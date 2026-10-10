@@ -12,12 +12,16 @@ from torchvision.transforms import transforms
 
 from src.data.eval_collate import eval_collate_fn
 
+import open_clip
+
 # Standard for many base Mamba models
 Image.MAX_IMAGE_PIXELS = None
 
 import json
+
 import numpy as np
-from transformers import AutoTokenizer, __version__ as transformers_version
+from transformers import AutoTokenizer
+from transformers import __version__ as transformers_version
 
 tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
 
@@ -161,6 +165,9 @@ class GAIADataModule(LightningDataModule):
             pin_memory: bool = False,
             max_length: int = 128,
             max_captions: int = 5,
+            image_transform_mode: str = "legacy",
+            clip_model_name: str = "ViT-B-32",
+            clip_pretrained: str = "openai",
     ) -> None:
         super().__init__()
 
@@ -172,22 +179,44 @@ class GAIADataModule(LightningDataModule):
 
         self.save_hyperparameters(logger=False, ignore=['tokenizer'])
 
-        self.train_transforms = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.9, 1.1)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]),
-            transforms.RandomErasing(p=0.2),
-        ])
+        if image_transform_mode == "legacy":
+            self.train_transforms = transforms.Compose([
+                transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.9, 1.1)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]),
+                transforms.RandomErasing(p=0.2),
+            ])
 
-        self.val_test_transforms = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757])
-        ])
+            self.val_test_transforms = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757])
+            ])
+        elif image_transform_mode == "openclip":
+            # Import lazily so legacy configurations do not depend on OpenCLIP.
+            import open_clip
+
+            temporary_clip_model, preprocess_train, preprocess_val = (
+                open_clip.create_model_and_transforms(
+                    model_name=clip_model_name,
+                    pretrained=clip_pretrained,
+                )
+            )
+
+            self.train_transforms = preprocess_train
+            self.val_test_transforms = preprocess_val
+
+            del temporary_clip_model
+
+        else:
+            raise ValueError(
+                "image_transform_mode must be either 'legacy' or 'openclip', "
+                f"got {image_transform_mode!r}."
+            )
 
         self.data_train: Optional[Dataset] = None
         self.data_val: Optional[Dataset] = None
