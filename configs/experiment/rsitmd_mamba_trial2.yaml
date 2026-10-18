@@ -1,0 +1,10 @@
+# @package _global_
+
+defaults:
+  - rsitmd_mamba_trial1
+  - _self_
+
+tags: ["rsitmd", "mamba3-pretrained", "trial2-gentle-augmentation"]
+
+data:
+  train_augmentation: gentle

@@ -1,0 +1,32 @@
+# @package _global_
+
+defaults:
+  - rsitmd_clip_trial3
+  - _self_
+
+tags:
+  - rsitmd
+  - clip
+  - trial4-last-visual-block
+  - shared-holdout
+
+# First screen uses the existing seed-42 Trial 3 as its comparator.
+seed: 42
+
+train: true
+validate_only: false
+test: false
+ckpt_path: null
+
+use_dual_encoder_preprocess: true
+adapters_only: false
+last_visual_block_only: true
+
+model:
+  dual_encoder:
+    _target_: src.models.components.clip_last_visual_block.CLIPLastVisualBlockAdapterDualEncoder
+    visual_block_lr: 0.00001
+
+  optimizer:
+    lr: 0.001
+    weight_decay: 0.01

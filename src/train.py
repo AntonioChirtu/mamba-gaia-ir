@@ -143,6 +143,71 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model)
 
+    # Immediately after model instantiation, before trainable_report(model).
+    dual_encoder = getattr(model, "dual_encoder", None)
+
+    adapters_only = bool(cfg.get("adapters_only", False))
+    last_visual_block_only = bool(
+        cfg.get("last_visual_block_only", False)
+    )
+    adapter_training = adapters_only or last_visual_block_only
+
+    if adapters_only and last_visual_block_only:
+        raise ValueError(
+            "Choose adapters_only OR last_visual_block_only, not both."
+        )
+
+    if cfg.get("use_dual_encoder_preprocess", False):
+        if dual_encoder is None:
+            raise ValueError(
+                "use_dual_encoder_preprocess requires model.dual_encoder."
+            )
+
+        datamodule.val_test_transforms = dual_encoder.preprocess_val
+
+        if adapter_training:
+            # Preserve Trial 3's deterministic training preprocessing.
+            datamodule.train_transforms = dual_encoder.preprocess_val
+
+    if adapter_training:
+        if dual_encoder is None:
+            raise ValueError(
+                "Adapter training requires model.dual_encoder."
+            )
+
+        for name in ("image_adapter", "text_adapter"):
+            if not hasattr(dual_encoder, name):
+                raise ValueError(f"Missing adapter: {name}")
+
+        # Freeze wrapper parameters as well as the pretrained towers.
+        model.requires_grad_(False)
+
+        if last_visual_block_only:
+            enable = getattr(
+                dual_encoder,
+                "enable_last_visual_block_training",
+                None,
+            )
+            if not callable(enable):
+                raise ValueError(
+                    "The dual encoder does not support last-block training."
+                )
+            enable()
+        else:
+            dual_encoder.image_adapter.requires_grad_(True)
+            dual_encoder.text_adapter.requires_grad_(True)
+
+        trainable_count = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
+        log.info(f"Trainable parameters: {trainable_count:,}")
+
+    elif (
+        cfg.get("use_dual_encoder_preprocess", False)
+        and cfg.get("validate_only", False)
+    ):
+        model.requires_grad_(False)
+
     trainable_report(model)
 
     log.info("Instantiating callbacks...")

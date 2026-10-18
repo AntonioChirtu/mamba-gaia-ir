@@ -1,0 +1,72 @@
+# @package _global_
+
+defaults:
+  - mamba3_pretrained_text_exp
+  - override /data: rsitmd
+  - _self_
+
+tags: ["rsitmd", "mamba3-pretrained", "trial1-normalization"]
+seed: 12345
+
+train: true
+validate_only: false
+test: false
+ckpt_path: null
+
+# Do not apply Trial 0's CLIP preprocessing override.
+use_dual_encoder_preprocess: false
+
+data:
+  batch_size: 64
+  max_length: 64
+  num_workers: 4
+  pin_memory: true
+  image_normalization: vit_b32_imagenet
+  train_augmentation: legacy
+
+model:
+  compile: false
+  text_net:
+    max_length: 64
+    unfreeze_embedding: false
+    unfreeze_last_n_blocks: 4
+    dropout: 0.2
+
+  image_net:
+    backbone: vit_b32
+    pretrained: true
+    d_model: 512
+    use_layer_norm: true
+    freeze_backbone: false
+    dropout: 0.2
+
+  optimizer:
+    lr: 0.0001
+    weight_decay: 0.1
+
+  scheduler:
+    mode: max
+    factor: 0.3
+    patience: 2
+
+  logit_scale_init: 0.07
+
+trainer:
+  min_epochs: 0
+  max_epochs: 100
+  precision: bf16-mixed
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1
+  val_check_interval: 1.0
+  log_every_n_steps: 5
+
+callbacks:
+  early_stopping: null
+  model_checkpoint:
+    monitor: val/mean_R1
+    mode: max
+    save_top_k: 1
+    save_last: true

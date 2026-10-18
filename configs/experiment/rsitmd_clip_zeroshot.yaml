@@ -1,0 +1,40 @@
+# @package _global_
+
+defaults:
+  - clip_full_frozen
+  - override /data: rsitmd
+  - _self_
+
+tags: ["rsitmd", "clip", "zero-shot", "shared-holdout"]
+seed: 12345
+
+train: false
+validate_only: true
+test: false
+ckpt_path: null
+
+use_dual_encoder_preprocess: true
+
+model:
+  compile: false
+  dual_encoder:
+    model_name: ViT-B-32
+    pretrained: openai
+    unfreeze_last_n_visual_blocks: 0
+    unfreeze_last_n_text_blocks: 0
+    fully_unfreeze_visual: false
+    fully_unfreeze_text: false
+    train_projection_heads: false
+    train_logit_scale: false
+
+data:
+  batch_size: 128
+  num_workers: 4
+  max_length: 77
+
+trainer:
+  min_epochs: 0
+  max_epochs: 0
+  precision: 32-true
+  accumulate_grad_batches: 1
+  limit_val_batches: 1.0

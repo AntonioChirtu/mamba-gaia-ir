@@ -1,5 +1,6 @@
 import json
 import os
+import random
 from typing import Any, Dict, List, Optional, Tuple  # noqa: UP035
 
 from hydra.utils import instantiate
@@ -7,10 +8,10 @@ from lightning import LightningDataModule
 from omegaconf import DictConfig
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torchvision.models import ViT_B_32_Weights
 from torchvision.transforms import transforms
 
 from src.data.eval_collate import eval_collate_fn
-import random
 
 # Standard for many base Mamba models
 Image.MAX_IMAGE_PIXELS = None
@@ -292,6 +293,8 @@ class RSITMDDataModule(LightningDataModule):
         pin_memory: bool = False,
         max_length: int = 24,
         max_captions: int = 5,
+        image_normalization: str = "legacy",
+        train_augmentation: str = "legacy",
     ) -> None:
         super().__init__()
 
@@ -308,33 +311,91 @@ class RSITMDDataModule(LightningDataModule):
         self.max_length = max_length
         self.max_captions = max_captions
 
-        # --- TRAINING TRANSFORMS ---
-        self.train_transforms = transforms.Compose(
-            [
-                transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.9, 1.1)),
+        # # --- TRAINING TRANSFORMS ---
+        # self.train_transforms = transforms.Compose(
+        #     [
+        #         transforms.RandomResizedCrop(224, scale=(0.5, 1.0), ratio=(0.9, 1.1)),
+        #         transforms.RandomHorizontalFlip(),
+        #         transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
+        #         transforms.RandomGrayscale(p=0.2),
+        #         transforms.ToTensor(),
+        #         # Note: You can keep these CLIP normalization values,
+        #         # but standard ImageNet stats ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        #         # are also common if your vision backbone isn't CLIP.
+        #         transforms.Normalize(
+        #             mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]
+        #         ),
+        #         transforms.RandomErasing(p=0.2),
+        #     ]
+        # )
+        # # --- VAL/TEST TRANSFORMS ---
+        # self.val_test_transforms = transforms.Compose(
+        #     [
+        #         transforms.Resize(256),
+        #         transforms.CenterCrop(224),
+        #         transforms.ToTensor(),
+        #         transforms.Normalize(
+        #             mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]
+        #         ),
+        #     ]
+        # )
+
+        # Defaults preserve existing experiments.
+        if image_normalization == "legacy":
+            mean = [0.4814, 0.4578, 0.4082]
+            std = [0.2686, 0.2613, 0.2757]
+        elif image_normalization == "vit_b32_imagenet":
+            # Same weights enum used by ViTOnlySimpleOptimized.
+            # Reading transform metadata does not download model weights.
+            preprocessing = ViT_B_32_Weights.DEFAULT.transforms()
+            mean = preprocessing.mean
+            std = preprocessing.std
+        else:
+            raise ValueError(
+                f"Unknown image_normalization: {image_normalization!r}"
+            )
+
+        if train_augmentation == "legacy":
+            train_ops = [
+                transforms.RandomResizedCrop(
+                    224, scale=(0.5, 1.0), ratio=(0.9, 1.1)
+                ),
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
                 transforms.RandomGrayscale(p=0.2),
                 transforms.ToTensor(),
-                # Note: You can keep these CLIP normalization values,
-                # but standard ImageNet stats ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-                # are also common if your vision backbone isn't CLIP.
-                transforms.Normalize(
-                    mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]
-                ),
+                transforms.Normalize(mean=mean, std=std),
                 transforms.RandomErasing(p=0.2),
             ]
-        )
+        elif train_augmentation == "gentle":
+            train_ops = [
+                transforms.RandomResizedCrop(
+                    224, scale=(0.8, 1.0), ratio=(0.95, 1.05)
+                ),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(
+                    brightness=0.1,
+                    contrast=0.1,
+                    saturation=0.1,
+                    hue=0.0,
+                ),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ]
+        else:
+            raise ValueError(
+                f"Unknown train_augmentation: {train_augmentation!r}"
+            )
 
-        # --- VAL/TEST TRANSFORMS ---
+        self.train_transforms = transforms.Compose(train_ops)
+
+        # Same evaluation geometry in both trials.
         self.val_test_transforms = transforms.Compose(
             [
                 transforms.Resize(256),
                 transforms.CenterCrop(224),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.4814, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2757]
-                ),
+                transforms.Normalize(mean=mean, std=std),
             ]
         )
 
@@ -399,6 +460,12 @@ class RSITMDDataModule(LightningDataModule):
                 len(ambiguous_test_captions),
             )
 
+            if stage == "fit" and not getattr(
+                self, "_token_lengths_logged", False
+            ):
+                self._analyze_token_lengths()
+                self._token_lengths_logged = True
+
 
         # --- TESTING STAGE ---
         if stage == "test" or stage is None:
@@ -411,6 +478,71 @@ class RSITMDDataModule(LightningDataModule):
                 split="test",
                 max_captions=self.max_captions,
             )
+
+
+    def _analyze_token_lengths(self):
+        import json
+        import numpy as np
+
+        # In this datamodule, validation uses the test split.
+        # Don't count that same held-out pool twice.
+        datasets = {
+            "train": self.data_train,
+            "heldout_used_as_val": self.data_val,
+        }
+
+        results = {}
+
+        for split, dataset in datasets.items():
+            captions = [
+                caption
+                for _, caption in dataset.data_pairs
+            ]
+
+            lengths = []
+
+            # Batch tokenization to keep memory usage bounded.
+            for start in range(0, len(captions), 512):
+                encoded = self.tokenizer(
+                    captions[start : start + 512],
+                    add_special_tokens=True,
+                    padding=False,
+                    truncation=False,
+                )
+                lengths.extend(
+                    len(ids) for ids in encoded["input_ids"]
+                )
+
+            lengths = np.asarray(lengths, dtype=np.int64)
+
+            if lengths.size == 0:
+                results[split] = {"n": 0}
+                continue
+
+            results[split] = {
+                "n": int(lengths.size),
+                "mean": float(lengths.mean()),
+                "median": float(np.median(lengths)),
+                "p95": float(np.percentile(lengths, 95)),
+                "p99": float(np.percentile(lengths, 99)),
+                "maximum": int(lengths.max()),
+                "fraction_gt_64": float(np.mean(lengths > 64)),
+                "fraction_gt_77": float(np.mean(lengths > 77)),
+                "fraction_gt_128": float(np.mean(lengths > 128)),
+                "fraction_gt_current_max_length": float(
+                    np.mean(lengths > self.hparams.max_length)
+                ),
+            }
+
+        results["metadata"] = {
+            "tokenizer": self.tokenizer.name_or_path,
+            "vocab_size": len(self.tokenizer),
+            "configured_max_length": self.hparams.max_length,
+            "add_special_tokens": True,
+        }
+
+        print("\nUNTRUNCATED TOKEN-LENGTH DISTRIBUTION")
+        print(json.dumps(results, indent=2), flush=True)   
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(

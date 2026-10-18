@@ -1,0 +1,79 @@
+# @package _global_
+
+defaults:
+  - clip_full_frozen
+  - override /data: rsitmd
+  - _self_
+
+tags: ["rsitmd", "clip", "trial3-residual-adapters", "shared-holdout"]
+seed: 12345
+
+train: true
+validate_only: false
+test: false
+ckpt_path: null
+
+use_dual_encoder_preprocess: true
+adapters_only: true
+
+data:
+  batch_size: 64
+  max_length: 77
+  num_workers: 4
+  pin_memory: true
+
+model:
+  compile: false
+  image_net: null
+  text_net: null
+
+  dual_encoder:
+    _target_: src.models.components.clip_residual_adapters.CLIPResidualAdapterDualEncoder
+    model_name: ViT-B-32
+    pretrained: openai
+
+    unfreeze_last_n_visual_blocks: 0
+    unfreeze_last_n_text_blocks: 0
+    fully_unfreeze_visual: false
+    fully_unfreeze_text: false
+    train_projection_heads: false
+    train_logit_scale: false
+
+    adapter_bottleneck: 64
+    adapter_scale: 0.2
+    adapter_dropout: 0.1
+
+  optimizer:
+    lr: 0.001
+    weight_decay: 0.01
+
+  scheduler:
+    mode: max
+    factor: 0.5
+    patience: 3
+
+trainer:
+  min_epochs: 0
+  max_epochs: 30
+  precision: 32-true
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: norm
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1
+  val_check_interval: 1.0
+  log_every_n_steps: 5
+
+callbacks:
+  early_stopping:
+    monitor: val/mean_R1
+    mode: max
+    patience: 8
+    min_delta: 0.0
+    strict: true
+
+  model_checkpoint:
+    monitor: val/mean_R1
+    mode: max
+    save_top_k: 1
+    save_last: true

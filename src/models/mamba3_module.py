@@ -1256,7 +1256,27 @@ class Mamba3LitModule(LightningModule):
 
         :return: A dict containing the configured optimizers and learning-rate schedulers to be used for training.
         """
-        optimizer = self.hparams.optimizer(params=self.trainer.model.parameters())
+        # optimizer = self.hparams.optimizer(params=self.trainer.model.parameters())
+        dual_encoder = getattr(self, "dual_encoder", None)
+        group_builder = getattr(dual_encoder, "optimizer_param_groups", None)
+
+        if callable(group_builder):
+            param_groups = group_builder()
+
+            # Guard against accidentally omitting or duplicating trainable weights.
+            included = [id(p) for group in param_groups for p in group["params"]]
+            expected = {id(p) for p in self.parameters() if p.requires_grad}
+
+            if len(included) != len(set(included)) or set(included) != expected:
+                raise ValueError(
+                    "Optimizer groups must contain every trainable parameter "
+                    "exactly once, and no frozen parameters."
+                )
+
+            optimizer = self.hparams.optimizer(params=param_groups)
+        else:
+            optimizer = self.hparams.optimizer(params=self.trainer.model.parameters())
+
         if self.hparams.scheduler is not None:
             scheduler = self.hparams.scheduler(optimizer=optimizer)
             return {
